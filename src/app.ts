@@ -8,8 +8,20 @@ import {
   BookingRateLimitExceeded,
   BookingRateLimitUnavailable,
   clientIdentityHash,
+  emailIdentityHash,
+  normalizeEmailAddress,
   type BookingRateLimitConfig,
 } from './booking-rate-limit.js';
+import {
+  confirmVerificationChallenge,
+  createVerificationEmailSender,
+  markVerificationDeliveryFailed,
+  markVerificationSent,
+  prepareVerificationChallenge,
+  readCustomerVerificationToken,
+  VerificationRateLimitExceeded,
+  type VerificationDependencies,
+} from './customer-verification.js';
 
 class ApiError extends Error {
   constructor(public readonly statusCode: number, public readonly code: string, message: string) { super(message); }
@@ -29,6 +41,14 @@ type ReservationBody = {
 const RESERVATION_NOT_FOUND = { code: 'reservation_not_found', message: 'Reservation not found.' } as const;
 const RATE_LIMITED = { code: 'rate_limited', message: 'Too many failed confirmation code attempts.' } as const;
 const FAILURE_LIMIT = 5;
+const CUSTOMER_VERIFICATION_REQUIRED = {
+  code: 'customer_verification_required', message: 'Verify your email before booking.',
+} as const;
+const VERIFICATION_FAILED = { code: 'verification_failed', message: 'Verification could not be completed.' } as const;
+const VERIFICATION_UNAVAILABLE = { code: 'service_unavailable', message: 'Service temporarily unavailable.' } as const;
+const VERIFICATION_DELIVERY_UNAVAILABLE = {
+  code: 'verification_delivery_unavailable', message: 'Verification email could not be sent.',
+} as const;
 
 function confirmationCodeMatches(supplied: unknown, expected: string): boolean {
   const valid = typeof supplied === 'string' && /^[0-9a-f]{12}$/i.test(supplied);
@@ -139,7 +159,8 @@ async function book(
   key: string,
   size: number,
   local: string,
-  clientAddress: string,
+  identityHash: Buffer,
+  tokenExpiresAtSeconds: number,
   rateLimitConfig: BookingRateLimitConfig,
 ): Promise<{ body: ReservationBody; replay: boolean }> {
   if (!key || key.length > 200) throw new ApiError(400, 'invalid_idempotency_key', 'Idempotency-Key must contain 1 to 200 characters.');
@@ -150,6 +171,15 @@ async function book(
   try {
     await client.query('BEGIN');
     transactionOpen = true;
+    let databaseNow: { seconds: string };
+    try {
+      databaseNow = (await client.query<{ seconds: string }>(
+        'SELECT floor(extract(epoch FROM clock_timestamp()))::bigint::text AS seconds',
+      )).rows[0];
+    } catch { throw new BookingRateLimitUnavailable(); }
+    if (BigInt(tokenExpiresAtSeconds) <= BigInt(databaseNow.seconds)) {
+      throw new ApiError(401, CUSTOMER_VERIFICATION_REQUIRED.code, CUSTOMER_VERIFICATION_REQUIRED.message);
+    }
     const restaurant = await client.query<{ id: string; timezone: string; active: boolean }>(
       'SELECT id, timezone, active FROM restaurants WHERE id = $1 FOR SHARE', [restaurantId],
     );
@@ -160,15 +190,17 @@ async function book(
     const fingerprint = createHash('sha256').update(JSON.stringify([restaurantId, size, start.toString()])).digest('hex');
 
     const claim = await client.query(
-      `INSERT INTO idempotency_records (restaurant_id, idempotency_key, request_fingerprint)
-       VALUES ($1, $2, $3) ON CONFLICT DO NOTHING RETURNING idempotency_key`, [restaurantId, key, fingerprint],
+      `INSERT INTO idempotency_records (restaurant_id, idempotency_key, request_fingerprint, customer_identity_hash)
+       VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING RETURNING idempotency_key`, [restaurantId, key, fingerprint, identityHash],
     );
     if (claim.rowCount === 0) {
-      const existing = await client.query<{ request_fingerprint: string; outcome: ReservationBody | null }>(
-        'SELECT request_fingerprint, outcome FROM idempotency_records WHERE restaurant_id = $1 AND idempotency_key = $2 FOR UPDATE', [restaurantId, key],
+      const existing = await client.query<{ request_fingerprint: string; customer_identity_hash: Buffer | null; outcome: ReservationBody | null }>(
+        'SELECT request_fingerprint, customer_identity_hash, outcome FROM idempotency_records WHERE restaurant_id = $1 AND idempotency_key = $2 FOR UPDATE', [restaurantId, key],
       );
       if (!existing.rowCount) throw new Error('Idempotency conflict row disappeared.');
-      if (existing.rows[0].request_fingerprint !== fingerprint) {
+      const storedIdentity = existing.rows[0].customer_identity_hash;
+      const sameIdentity = storedIdentity !== null && storedIdentity.length === identityHash.length && timingSafeEqual(storedIdentity, identityHash);
+      if (existing.rows[0].request_fingerprint !== fingerprint || !sameIdentity) {
         throw new ApiError(409, 'idempotency_key_conflict', 'This idempotency key was already used for a different request.');
       }
       if (!existing.rows[0].outcome) throw new Error('Committed idempotency row has no outcome.');
@@ -177,9 +209,6 @@ async function book(
       return { body: existing.rows[0].outcome, replay: true };
     }
 
-    let identityHash: Buffer;
-    try { identityHash = clientIdentityHash(clientAddress, rateLimitConfig.hmacSecret); }
-    catch { throw new BookingRateLimitUnavailable(); }
     await acquireBookingQuota(client, restaurantId, identityHash, rateLimitConfig);
 
     const candidates = await client.query<{ id: string; capacity: number }>(
@@ -237,7 +266,13 @@ async function book(
   }
 }
 
-export function buildApp(rateLimitConfig: BookingRateLimitConfig, db: Pool = pool): FastifyInstance {
+export function buildApp(
+  rateLimitConfig: BookingRateLimitConfig,
+  db: Pool = pool,
+  verificationDependencies: VerificationDependencies = {},
+): FastifyInstance {
+  const sendVerificationEmail = verificationDependencies.sendVerificationEmail ?? createVerificationEmailSender(rateLimitConfig);
+  const generateOtp = verificationDependencies.generateOtp;
   const app = Fastify({
     logger: false,
     trustProxy: rateLimitConfig.trustedProxyCidrs.length > 0 ? [...rateLimitConfig.trustedProxyCidrs] : false,
@@ -289,6 +324,69 @@ export function buildApp(rateLimitConfig: BookingRateLimitConfig, db: Pool = poo
     },
   );
 
+  app.post<{ Body: { email?: unknown } }>('/booking-verifications', async (request, reply) => {
+    let normalizedEmail: string;
+    try {
+      if (typeof request.body?.email !== 'string') throw new Error('Invalid email.');
+      normalizedEmail = normalizeEmailAddress(request.body.email);
+    } catch {
+      throw new ApiError(422, 'invalid_input', 'email must be a valid email address.');
+    }
+
+    let emailHash: Buffer;
+    let ipHash: Buffer;
+    try {
+      emailHash = emailIdentityHash(normalizedEmail, rateLimitConfig.hmacSecret);
+      ipHash = clientIdentityHash(request.ip, rateLimitConfig.hmacSecret);
+    } catch {
+      return reply.code(503).send(VERIFICATION_UNAVAILABLE);
+    }
+
+    let prepared: Awaited<ReturnType<typeof prepareVerificationChallenge>>;
+    try {
+      prepared = await prepareVerificationChallenge(db, normalizedEmail, emailHash, ipHash, rateLimitConfig, generateOtp);
+    } catch (error) {
+      if (error instanceof VerificationRateLimitExceeded) {
+        return reply.header('Retry-After', String(error.retryAfterSeconds)).code(429).send({
+          code: 'verification_rate_limited', message: 'Verification rate limit reached. Try again later.',
+        });
+      }
+      return reply.code(503).send(VERIFICATION_UNAVAILABLE);
+    }
+
+    if (prepared.email !== undefined && prepared.code !== undefined) {
+      try {
+        await sendVerificationEmail(prepared.email, prepared.code);
+      } catch {
+        try { await markVerificationDeliveryFailed(db, prepared.verificationId); } catch { /* Generic delivery failure is returned either way. */ }
+        return reply.code(503).send(VERIFICATION_DELIVERY_UNAVAILABLE);
+      }
+      try {
+        const sentExpiry = await markVerificationSent(db, prepared.verificationId);
+        if (!sentExpiry) return reply.code(503).send(VERIFICATION_DELIVERY_UNAVAILABLE);
+        prepared.expiresAt = sentExpiry;
+      } catch {
+        return reply.code(503).send(VERIFICATION_DELIVERY_UNAVAILABLE);
+      }
+    }
+    return reply.code(202).send({ verification_id: prepared.verificationId, expires_at: prepared.expiresAt.toISOString() });
+  });
+
+  app.post<{ Params: { verification_id: string }; Body: { code?: unknown } }>(
+    '/booking-verifications/:verification_id/confirm', async (request, reply) => {
+      if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(request.params.verification_id)) {
+        return reply.code(400).send(VERIFICATION_FAILED);
+      }
+      try {
+        const confirmed = await confirmVerificationChallenge(db, request.params.verification_id, request.body?.code, rateLimitConfig);
+        if (!confirmed) return reply.code(400).send(VERIFICATION_FAILED);
+        return reply.code(200).send({ verification_token: confirmed.token, expires_at: confirmed.expiresAt.toISOString() });
+      } catch {
+        return reply.code(503).send(VERIFICATION_UNAVAILABLE);
+      }
+    },
+  );
+
   app.post<{ Params: { restaurant_id: string }; Body: { party_size: number; starts_at_local: string } }>(
     '/restaurants/:restaurant_id/reservations', async (request, reply) => {
       assertId(request.params.restaurant_id);
@@ -299,11 +397,13 @@ export function buildApp(rateLimitConfig: BookingRateLimitConfig, db: Pool = poo
       if (typeof request.body?.starts_at_local !== 'string') invalid('starts_at_local is required.');
       const key = request.headers['idempotency-key'];
       if (typeof key !== 'string') throw new ApiError(400, 'idempotency_key_required', 'Idempotency-Key header is required.');
+      const verifiedIdentity = readCustomerVerificationToken(request.headers['customer-verification-token'], rateLimitConfig.tokenSecret);
+      if (!verifiedIdentity) return reply.code(401).send(CUSTOMER_VERIFICATION_REQUIRED);
       let result: { body: ReservationBody; replay: boolean };
       try {
         result = await book(
           db, request.params.restaurant_id, key, size, request.body.starts_at_local,
-          request.ip, rateLimitConfig,
+          verifiedIdentity.identityHash, verifiedIdentity.expiresAtSeconds, rateLimitConfig,
         );
       } catch (error) {
         if (error instanceof BookingRateLimitExceeded) {

@@ -12,7 +12,14 @@ async function start(): Promise<void> {
     return;
   }
 
-  const app = buildApp(rateLimitConfig);
+  let app: ReturnType<typeof buildApp>;
+  try { app = buildApp(rateLimitConfig); }
+  catch {
+    console.error('Invalid booking rate-limit configuration.');
+    await pool.end();
+    process.exitCode = 1;
+    return;
+  }
   const host = process.env.HOST ?? '127.0.0.1';
   const port = Number(process.env.PORT ?? 3000);
 

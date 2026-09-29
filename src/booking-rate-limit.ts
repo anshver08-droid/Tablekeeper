@@ -10,6 +10,11 @@ export type BookingRateLimitConfig = {
   windowSeconds: number;
   hmacSecret: Buffer;
   trustedProxyCidrs: string[];
+  verificationMax: number;
+  verificationWindowSeconds: number;
+  tokenSecret: Buffer;
+  smtpUrl: string;
+  emailFrom: string;
 };
 
 export class BookingRateLimitConfigurationError extends Error {
@@ -54,20 +59,63 @@ function parseTrustedProxyCidrs(raw: string | undefined): string[] {
   return entries;
 }
 
+export function normalizeEmailAddress(value: string): string {
+  const normalized = value.trim().toLowerCase();
+  if (Buffer.byteLength(normalized, 'utf8') > 254) throw new Error('Invalid email address.');
+  const match = /^([^\s@<>(),;:\\[\]]+)@([^\s@<>(),;:\\[\]]+)$/.exec(normalized);
+  if (!match || Buffer.byteLength(match[1], 'utf8') > 64 || match[1].startsWith('.') || match[1].endsWith('.') || match[1].includes('..')) {
+    throw new Error('Invalid email address.');
+  }
+  const labels = match[2].split('.');
+  if (labels.length < 2 || labels.some((label) => !/^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(label))) {
+    throw new Error('Invalid email address.');
+  }
+  return normalized;
+}
+
+function requiredSecret(name: string, raw: string | undefined): Buffer {
+  if (raw === undefined || Buffer.byteLength(raw, 'utf8') < 32) {
+    throw new BookingRateLimitConfigurationError(`Invalid ${name}.`);
+  }
+  return Buffer.from(raw, 'utf8');
+}
+
+function validatedSmtpUrl(raw: string | undefined): string {
+  if (!raw) throw new BookingRateLimitConfigurationError('Invalid SMTP_URL.');
+  let url: URL;
+  try { url = new URL(raw); }
+  catch { throw new BookingRateLimitConfigurationError('Invalid SMTP_URL.'); }
+  if (!['smtp:', 'smtps:'].includes(url.protocol) || !url.hostname || url.hash || url.search || (url.pathname !== '/' && url.pathname !== '')) {
+    throw new BookingRateLimitConfigurationError('Invalid SMTP_URL.');
+  }
+  return raw;
+}
+
 export function loadBookingRateLimitConfig(env: NodeJS.ProcessEnv = process.env): BookingRateLimitConfig {
   const max = positiveSafeInteger('BOOKING_RATE_LIMIT_MAX', env.BOOKING_RATE_LIMIT_MAX, 5);
   const windowSeconds = positiveSafeInteger(
     'BOOKING_RATE_LIMIT_WINDOW_SECONDS', env.BOOKING_RATE_LIMIT_WINDOW_SECONDS, 900, MAX_WINDOW_SECONDS,
   );
-  const secretValue = env.BOOKING_RATE_LIMIT_HMAC_SECRET;
-  if (secretValue === undefined || Buffer.byteLength(secretValue, 'utf8') < 32) {
-    throw new BookingRateLimitConfigurationError('Invalid BOOKING_RATE_LIMIT_HMAC_SECRET.');
-  }
+  const hmacSecret = requiredSecret('BOOKING_RATE_LIMIT_HMAC_SECRET', env.BOOKING_RATE_LIMIT_HMAC_SECRET);
+  const tokenSecret = requiredSecret('CUSTOMER_VERIFICATION_TOKEN_SECRET', env.CUSTOMER_VERIFICATION_TOKEN_SECRET);
+  const smtpUrl = validatedSmtpUrl(env.SMTP_URL);
+  const emailFrom = env.EMAIL_FROM;
+  if (emailFrom === undefined) throw new BookingRateLimitConfigurationError('Invalid EMAIL_FROM.');
+  let validatedEmailFrom: string;
+  try { validatedEmailFrom = normalizeEmailAddress(emailFrom); }
+  catch { throw new BookingRateLimitConfigurationError('Invalid EMAIL_FROM.'); }
   return {
     max,
     windowSeconds,
-    hmacSecret: Buffer.from(secretValue, 'utf8'),
+    hmacSecret,
     trustedProxyCidrs: parseTrustedProxyCidrs(env.TRUSTED_PROXY_CIDRS),
+    verificationMax: positiveSafeInteger('VERIFICATION_RATE_LIMIT_MAX', env.VERIFICATION_RATE_LIMIT_MAX, 5),
+    verificationWindowSeconds: positiveSafeInteger(
+      'VERIFICATION_RATE_LIMIT_WINDOW_SECONDS', env.VERIFICATION_RATE_LIMIT_WINDOW_SECONDS, 900, MAX_WINDOW_SECONDS,
+    ),
+    tokenSecret,
+    smtpUrl,
+    emailFrom: validatedEmailFrom,
   };
 }
 
@@ -94,6 +142,11 @@ export function normalizeClientAddress(address: string): string {
 
 export function clientIdentityHash(address: string, secret: Buffer): Buffer {
   return createHmac('sha256', secret).update(normalizeClientAddress(address), 'utf8').digest();
+}
+
+export function emailIdentityHash(email: string, secret: Buffer): Buffer {
+  const normalizedEmail = normalizeEmailAddress(email);
+  return createHmac('sha256', secret).update('tablekeeper:email:v1:', 'utf8').update(normalizedEmail, 'utf8').digest();
 }
 
 export async function acquireBookingQuota(
