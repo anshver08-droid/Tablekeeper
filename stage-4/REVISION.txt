@@ -1,0 +1,3 @@
+Stage 4 implementation and tests reviewed at: b1f4833d5f8a5d4c64b4665fa197f05b8638411c
+Reviewer decision: RELEASE PASS
+Snapshot contents copied from the reviewed implementation commit.
