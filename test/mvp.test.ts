@@ -275,6 +275,27 @@ test('reservation access requires a matching code and hides unknown versus incor
   assert.deepEqual(valid.json(), created.json());
 });
 
+test('DELETE without a confirmation code is indistinguishable from missing-code GET and leaves the reservation unchanged', async () => {
+  const { id } = await restaurant();
+  const created = await post(id, 'delete-without-code');
+  const reservationId = created.json().id as string;
+  const before = await pool.query('SELECT to_jsonb(r) AS reservation FROM reservations r WHERE id = $1', [reservationId]);
+
+  const missingGet = await app.inject(`/reservations/${reservationId}`);
+  const missingDelete = await app.inject({ method: 'DELETE', url: `/reservations/${reservationId}` });
+  const expected = { code: 'reservation_not_found', message: 'Reservation not found.' };
+  assert.equal(missingDelete.statusCode, 404);
+  assert.deepEqual(missingDelete.json(), expected);
+  assert.deepEqual(missingDelete.json(), missingGet.json());
+  assert.doesNotMatch(missingDelete.body, /confirmation_code|party_size|table_capacity|starts_at|timezone/i);
+
+  const after = await pool.query('SELECT to_jsonb(r) AS reservation FROM reservations r WHERE id = $1', [reservationId]);
+  assert.deepEqual(after.rows[0].reservation, before.rows[0].reservation);
+  const authorizedGet = await reservationRequest('GET', reservationId, created.json().confirmation_code);
+  assert.equal(authorizedGet.statusCode, 200);
+  assert.deepEqual(authorizedGet.json(), created.json());
+});
+
 test('failed credentials throttle atomically, correct credentials reset, and reservations are isolated', async () => {
   const { id } = await restaurant();
   const first = await post(id, 'throttle-first');
