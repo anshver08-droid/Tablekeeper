@@ -1,8 +1,15 @@
 import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
 import Fastify, { type FastifyInstance } from 'fastify';
-import type { Pool } from 'pg';
+import type { Pool, PoolClient } from 'pg';
 import { pool } from './db.js';
 import { LocalTimeError, formatInZone, resolveDateAndTime, resolveLocalTime } from './time.js';
+import {
+  acquireBookingQuota,
+  BookingRateLimitExceeded,
+  BookingRateLimitUnavailable,
+  clientIdentityHash,
+  type BookingRateLimitConfig,
+} from './booking-rate-limit.js';
 
 class ApiError extends Error {
   constructor(public readonly statusCode: number, public readonly code: string, message: string) { super(message); }
@@ -126,9 +133,19 @@ function reservationBody(row: {
   };
 }
 
-async function book(db: Pool, restaurantId: string, key: string, size: number, local: string): Promise<{ body: ReservationBody; replay: boolean }> {
+async function book(
+  db: Pool,
+  restaurantId: string,
+  key: string,
+  size: number,
+  local: string,
+  clientAddress: string,
+  rateLimitConfig: BookingRateLimitConfig,
+): Promise<{ body: ReservationBody; replay: boolean }> {
   if (!key || key.length > 200) throw new ApiError(400, 'invalid_idempotency_key', 'Idempotency-Key must contain 1 to 200 characters.');
-  const client = await db.connect();
+  let client: PoolClient;
+  try { client = await db.connect(); }
+  catch { throw new BookingRateLimitUnavailable(); }
   let transactionOpen = false;
   try {
     await client.query('BEGIN');
@@ -159,6 +176,11 @@ async function book(db: Pool, restaurantId: string, key: string, size: number, l
       transactionOpen = false;
       return { body: existing.rows[0].outcome, replay: true };
     }
+
+    let identityHash: Buffer;
+    try { identityHash = clientIdentityHash(clientAddress, rateLimitConfig.hmacSecret); }
+    catch { throw new BookingRateLimitUnavailable(); }
+    await acquireBookingQuota(client, restaurantId, identityHash, rateLimitConfig);
 
     const candidates = await client.query<{ id: string; capacity: number }>(
       `SELECT t.id, t.capacity
@@ -215,8 +237,11 @@ async function book(db: Pool, restaurantId: string, key: string, size: number, l
   }
 }
 
-export function buildApp(db: Pool = pool): FastifyInstance {
-  const app = Fastify({ logger: false });
+export function buildApp(rateLimitConfig: BookingRateLimitConfig, db: Pool = pool): FastifyInstance {
+  const app = Fastify({
+    logger: false,
+    trustProxy: rateLimitConfig.trustedProxyCidrs.length > 0 ? [...rateLimitConfig.trustedProxyCidrs] : false,
+  });
   app.setErrorHandler((error, _request, reply) => {
     app.log.error(error);
     const mapped = errorBody(error);
@@ -274,7 +299,23 @@ export function buildApp(db: Pool = pool): FastifyInstance {
       if (typeof request.body?.starts_at_local !== 'string') invalid('starts_at_local is required.');
       const key = request.headers['idempotency-key'];
       if (typeof key !== 'string') throw new ApiError(400, 'idempotency_key_required', 'Idempotency-Key header is required.');
-      const result = await book(db, request.params.restaurant_id, key, size, request.body.starts_at_local);
+      let result: { body: ReservationBody; replay: boolean };
+      try {
+        result = await book(
+          db, request.params.restaurant_id, key, size, request.body.starts_at_local,
+          request.ip, rateLimitConfig,
+        );
+      } catch (error) {
+        if (error instanceof BookingRateLimitExceeded) {
+          return reply.header('Retry-After', String(error.retryAfterSeconds)).code(429).send({
+            code: 'booking_rate_limited', message: 'Booking limit reached. Try again later.',
+          });
+        }
+        if (error instanceof BookingRateLimitUnavailable) {
+          return reply.code(503).send({ code: 'service_unavailable', message: 'Service temporarily unavailable.' });
+        }
+        throw error;
+      }
       return reply.code(result.replay ? 200 : 201).send(result.body);
     },
   );

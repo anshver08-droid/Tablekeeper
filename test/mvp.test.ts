@@ -1,13 +1,22 @@
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
+import { spawnSync } from 'node:child_process';
 import { after, test } from 'node:test';
 import { setTimeout as delay } from 'node:timers/promises';
 import type { FastifyInstance } from 'fastify';
 import { buildApp, insertRestaurant, insertTable } from '../src/app.js';
+import { clientIdentityHash, loadBookingRateLimitConfig, normalizeClientAddress } from '../src/booking-rate-limit.js';
 import { migrate, pool } from '../src/db.js';
 
 await migrate();
-const app: FastifyInstance = buildApp(pool);
+const testSecret = 'tablekeeper-stage-three-test-secret-32-bytes';
+const testConfig = loadBookingRateLimitConfig({
+  BOOKING_RATE_LIMIT_MAX: '5',
+  BOOKING_RATE_LIMIT_WINDOW_SECONDS: '900',
+  BOOKING_RATE_LIMIT_HMAC_SECRET: testSecret,
+  TRUSTED_PROXY_CIDRS: '',
+});
+const app: FastifyInstance = buildApp(testConfig, pool);
 await app.ready();
 
 after(async () => {
@@ -22,12 +31,35 @@ async function restaurant(zone = 'UTC', capacities: number[] = [4]) {
   return { id, tableIds };
 }
 
-function post(id: string, key: string, startsAt = '2026-01-15T19:00', size = 2) {
-  return app.inject({ method: 'POST', url: `/restaurants/${id}/reservations`, headers: { 'idempotency-key': key }, payload: { party_size: size, starts_at_local: startsAt } });
+function post(
+  id: string,
+  key: string,
+  startsAt = '2026-01-15T19:00',
+  size = 2,
+  options: { app?: FastifyInstance; remoteAddress?: string; headers?: Record<string, string> } = {},
+) {
+  return (options.app ?? app).inject({
+    method: 'POST', url: `/restaurants/${id}/reservations`, remoteAddress: options.remoteAddress ?? '192.0.2.1',
+    headers: { 'idempotency-key': key, ...options.headers }, payload: { party_size: size, starts_at_local: startsAt },
+  });
 }
 
 function reservationRequest(method: 'GET' | 'DELETE', id: string, code: string) {
   return app.inject({ method, url: `/reservations/${id}`, headers: { 'reservation-confirmation-code': code } });
+}
+
+function configEnv(overrides: Record<string, string | undefined> = {}): NodeJS.ProcessEnv {
+  return {
+    BOOKING_RATE_LIMIT_MAX: '5',
+    BOOKING_RATE_LIMIT_WINDOW_SECONDS: '900',
+    BOOKING_RATE_LIMIT_HMAC_SECRET: testSecret,
+    TRUSTED_PROXY_CIDRS: '',
+    ...overrides,
+  };
+}
+
+function rateConfig(max: number, trustedProxyCidrs = '') {
+  return loadBookingRateLimitConfig(configEnv({ BOOKING_RATE_LIMIT_MAX: String(max), TRUSTED_PROXY_CIDRS: trustedProxyCidrs }));
 }
 
 test('invalid requests keep safe structured 4xx status codes, including oversized JSON', async () => {
@@ -76,6 +108,311 @@ test('invalid requests keep safe structured 4xx status codes, including oversize
   assert.equal(oversized.statusCode, 413);
   assert.deepEqual(oversized.json(), { code: 'payload_too_large', message: 'Request body is too large.' });
   assert.doesNotMatch(JSON.stringify(oversized.json()), /FST_ERR|body limit|internal/i);
+});
+
+test('booking quota configuration is strict and invalid proxy trust fails before listening', () => {
+  const defaults = loadBookingRateLimitConfig(configEnv({
+    BOOKING_RATE_LIMIT_MAX: undefined,
+    BOOKING_RATE_LIMIT_WINDOW_SECONDS: undefined,
+  }));
+  assert.equal(defaults.max, 5);
+  assert.equal(defaults.windowSeconds, 900);
+  assert.deepEqual(defaults.trustedProxyCidrs, []);
+
+  for (const value of ['', '0', '-1', '1.5', '1e2', '+2', '9007199254740992']) {
+    assert.throws(() => loadBookingRateLimitConfig(configEnv({ BOOKING_RATE_LIMIT_MAX: value })), /BOOKING_RATE_LIMIT_MAX/);
+  }
+  for (const value of ['', '0', '-1', '1.5', '1e2', '9007199254740991', '8000000000001']) {
+    assert.throws(() => loadBookingRateLimitConfig(configEnv({ BOOKING_RATE_LIMIT_WINDOW_SECONDS: value })), /BOOKING_RATE_LIMIT_WINDOW_SECONDS/);
+  }
+  assert.throws(() => loadBookingRateLimitConfig(configEnv({ BOOKING_RATE_LIMIT_HMAC_SECRET: undefined })), /BOOKING_RATE_LIMIT_HMAC_SECRET/);
+  assert.throws(() => loadBookingRateLimitConfig(configEnv({ BOOKING_RATE_LIMIT_HMAC_SECRET: 'short-secret' })), /BOOKING_RATE_LIMIT_HMAC_SECRET/);
+  for (const value of ['*', '0.0.0.0/0', '::/0', '127.0.0.1/999', 'not-a-cidr', '127.0.0.1,,10.0.0.0/8']) {
+    assert.throws(() => loadBookingRateLimitConfig(configEnv({ TRUSTED_PROXY_CIDRS: value })), /TRUSTED_PROXY_CIDRS/);
+  }
+  assert.deepEqual(loadBookingRateLimitConfig(configEnv({ TRUSTED_PROXY_CIDRS: '127.0.0.1,10.0.0.0/8' })).trustedProxyCidrs, ['127.0.0.1', '10.0.0.0/8']);
+
+  const secretToProtect = 'never-echo-this-config-secret-0123456789';
+  const startup = spawnSync(process.execPath, ['node_modules/tsx/dist/cli.mjs', 'src/server.ts'], {
+    cwd: process.cwd(),
+    encoding: 'utf8',
+    timeout: 5_000,
+    env: { ...process.env, BOOKING_RATE_LIMIT_HMAC_SECRET: secretToProtect, TRUSTED_PROXY_CIDRS: '*' },
+  });
+  assert.equal(startup.error, undefined);
+  assert.equal(startup.status, 1);
+  const output = `${startup.stdout ?? ''}${startup.stderr ?? ''}`;
+  assert.match(output, /Invalid booking rate-limit configuration/);
+  assert.doesNotMatch(output, /TableKeeper listening/);
+  assert.doesNotMatch(output, new RegExp(secretToProtect));
+});
+
+test('client identity normalizes IPv4-mapped IPv6 and stores only a 32-byte HMAC digest', () => {
+  assert.equal(normalizeClientAddress('::ffff:192.0.2.1'), '192.0.2.1');
+  assert.equal(normalizeClientAddress('::ffff:c000:201'), '192.0.2.1');
+  assert.equal(normalizeClientAddress('2001:0DB8:0:0:0:0:0:1'), '2001:db8::1');
+  const ipv4 = clientIdentityHash('192.0.2.1', testConfig.hmacSecret);
+  assert.equal(ipv4.length, 32);
+  assert.deepEqual(clientIdentityHash('::ffff:c000:201', testConfig.hmacSecret), ipv4);
+  assert.notDeepEqual(ipv4, Buffer.from('192.0.2.1'));
+});
+
+test('default booking quota allows five new commits and rate-limits the sixth with a safe response', async () => {
+  const { id } = await restaurant('UTC', Array.from({ length: 8 }, () => 2));
+  const created = [];
+  for (let index = 0; index < 5; index += 1) {
+    created.push(await post(id, `default-quota-${index}`));
+  }
+  assert.ok(created.every((response) => response.statusCode === 201));
+  const limited = await post(id, 'default-quota-sixth');
+  assert.equal(limited.statusCode, 429);
+  assert.deepEqual(limited.json(), { code: 'booking_rate_limited', message: 'Booking limit reached. Try again later.' });
+  assert.match(limited.headers['retry-after'] ?? '', /^[1-9][0-9]*$/);
+  assert.doesNotMatch(limited.body, /192\.0\.2\.1|client_identity_hash|confirmation_code|table_capacity/i);
+
+  const reservations = await pool.query('SELECT count(*)::int AS count FROM reservations WHERE restaurant_id = $1', [id]);
+  const bucket = await pool.query(
+    'SELECT booking_count::text, client_identity_hash, octet_length(client_identity_hash)::int AS digest_length FROM booking_rate_limit_buckets WHERE restaurant_id = $1', [id],
+  );
+  assert.equal(reservations.rows[0].count, 5);
+  assert.equal(bucket.rows[0].booking_count, '5');
+  assert.equal(bucket.rows[0].digest_length, 32);
+  assert.deepEqual(bucket.rows[0].client_identity_hash, clientIdentityHash('192.0.2.1', testConfig.hmacSecret));
+});
+
+test('same-key replays bypass an exhausted quota and changed payloads consume no quota', async () => {
+  const config = rateConfig(1);
+  const limitedApp = buildApp(config, pool);
+  await limitedApp.ready();
+  try {
+    const { id } = await restaurant('UTC', [2, 2]);
+    const created = await post(id, 'quota-replay', '2026-01-15T19:00', 2, { app: limitedApp });
+    assert.equal(created.statusCode, 201);
+    const replays = await Promise.all(Array.from({ length: 8 }, () => post(id, 'quota-replay', '2026-01-15T19:00', 2, { app: limitedApp })));
+    assert.ok(replays.every((response) => response.statusCode === 200));
+    for (const replay of replays) assert.deepEqual(replay.json(), created.json());
+    const conflict = await post(id, 'quota-replay', '2026-01-15T20:00', 2, { app: limitedApp });
+    assert.equal(conflict.statusCode, 409);
+    assert.equal(conflict.json().code, 'idempotency_key_conflict');
+    const distinctKey = await post(id, 'quota-replay-new-key', '2026-01-15T21:00', 2, { app: limitedApp });
+    assert.equal(distinctKey.statusCode, 429);
+
+    const counts = await pool.query(
+      `SELECT (SELECT count(*)::int FROM reservations WHERE restaurant_id = $1) AS reservations,
+              (SELECT booking_count::int FROM booking_rate_limit_buckets WHERE restaurant_id = $1) AS quota`, [id],
+    );
+    assert.deepEqual(counts.rows[0], { reservations: 1, quota: 1 });
+  } finally {
+    await limitedApp.close();
+  }
+});
+
+test('parallel distinct-key bookings across app instances cannot exceed the shared quota', async () => {
+  const config = rateConfig(5);
+  const secondApp = buildApp(config, pool);
+  await secondApp.ready();
+  try {
+    const { id } = await restaurant('UTC', Array.from({ length: 12 }, () => 2));
+    const responses = await Promise.all(Array.from({ length: 12 }, (_, index) => post(
+      id, `concurrent-quota-${index}`, '2026-01-15T19:00', 2,
+      { app: index % 2 === 0 ? app : secondApp, remoteAddress: '198.51.100.21' },
+    )));
+    assert.equal(responses.filter((response) => response.statusCode === 201).length, 5);
+    assert.equal(responses.filter((response) => response.statusCode === 429).length, 7);
+    const counts = await pool.query(
+      `SELECT (SELECT count(*)::int FROM reservations WHERE restaurant_id = $1) AS reservations,
+              (SELECT booking_count::int FROM booking_rate_limit_buckets WHERE restaurant_id = $1) AS quota`, [id],
+    );
+    assert.deepEqual(counts.rows[0], { reservations: 5, quota: 5 });
+  } finally {
+    await secondApp.close();
+  }
+});
+
+test('booking quotas are independent by restaurant and client identity; address-hash failures fail closed', async () => {
+  const config = rateConfig(1);
+  const limitedApp = buildApp(config, pool);
+  await limitedApp.ready();
+  try {
+    const first = await restaurant('UTC', [2, 2]);
+    const second = await restaurant('UTC', [2]);
+    assert.equal((await post(first.id, 'identity-a-1', undefined, 2, { app: limitedApp, remoteAddress: '198.51.100.31' })).statusCode, 201);
+    assert.equal((await post(first.id, 'identity-a-2', undefined, 2, { app: limitedApp, remoteAddress: '198.51.100.31' })).statusCode, 429);
+    assert.equal((await post(first.id, 'identity-b-1', undefined, 2, { app: limitedApp, remoteAddress: '198.51.100.32' })).statusCode, 201);
+    assert.equal((await post(second.id, 'restaurant-independent', undefined, 2, { app: limitedApp, remoteAddress: '198.51.100.31' })).statusCode, 201);
+
+    const badAddress = await post(first.id, 'unhashable-address', undefined, 2, { app: limitedApp, remoteAddress: 'not-an-ip-address' });
+    assert.equal(badAddress.statusCode, 503);
+    assert.deepEqual(badAddress.json(), { code: 'service_unavailable', message: 'Service temporarily unavailable.' });
+    const failedState = await pool.query(
+      `SELECT count(*)::int AS reservations FROM reservations WHERE restaurant_id = $1 AND id IN
+         (SELECT reservation_id FROM idempotency_records WHERE restaurant_id = $1 AND idempotency_key = 'unhashable-address')`, [first.id],
+    );
+    const failedKey = await pool.query("SELECT count(*)::int AS count FROM idempotency_records WHERE restaurant_id = $1 AND idempotency_key = 'unhashable-address'", [first.id]);
+    assert.equal(failedState.rows[0].reservations, 0);
+    assert.equal(failedKey.rows[0].count, 0);
+    const identityRows = await pool.query('SELECT count(*)::int AS count FROM booking_rate_limit_buckets WHERE restaurant_id = $1', [first.id]);
+    assert.equal(identityRows.rows[0].count, 2);
+  } finally {
+    await limitedApp.close();
+  }
+});
+
+test('forwarding headers are ignored by default and accepted only from configured trusted proxy CIDRs', async () => {
+  const directApp = buildApp(rateConfig(1), pool);
+  const proxyApp = buildApp(rateConfig(1, '127.0.0.1/32'), pool);
+  await directApp.ready();
+  await proxyApp.ready();
+  try {
+    const directRestaurant = await restaurant('UTC', [2, 2]);
+    const directHeaders = (forwarded: string) => ({ 'x-forwarded-for': forwarded, forwarded: `for=${forwarded}` });
+    assert.equal((await post(directRestaurant.id, 'direct-first', undefined, 2, {
+      app: directApp, remoteAddress: '192.0.2.41', headers: directHeaders('203.0.113.41'),
+    })).statusCode, 201);
+    const spoofed = await post(directRestaurant.id, 'direct-spoof', undefined, 2, {
+      app: directApp, remoteAddress: '192.0.2.41', headers: directHeaders('203.0.113.42'),
+    });
+    assert.equal(spoofed.statusCode, 429);
+    assert.equal((await post(directRestaurant.id, 'direct-other-peer', undefined, 2, {
+      app: directApp, remoteAddress: '192.0.2.42', headers: directHeaders('203.0.113.41'),
+    })).statusCode, 201);
+
+    const proxyRestaurant = await restaurant('UTC', [2, 2, 2]);
+    assert.equal((await post(proxyRestaurant.id, 'proxy-client-a', undefined, 2, {
+      app: proxyApp, remoteAddress: '127.0.0.1', headers: { 'x-forwarded-for': '203.0.113.51' },
+    })).statusCode, 201);
+    const trustedClientLimited = await post(proxyRestaurant.id, 'proxy-client-a-limited', undefined, 2, {
+      app: proxyApp, remoteAddress: '127.0.0.1', headers: { 'x-forwarded-for': '203.0.113.51' },
+    });
+    assert.equal(trustedClientLimited.statusCode, 429);
+    assert.equal((await post(proxyRestaurant.id, 'proxy-client-b', undefined, 2, {
+      app: proxyApp, remoteAddress: '127.0.0.1', headers: { 'x-forwarded-for': '203.0.113.52' },
+    })).statusCode, 201);
+    assert.equal((await post(proxyRestaurant.id, 'untrusted-cannot-spoof', undefined, 2, {
+      app: proxyApp, remoteAddress: '192.0.2.43', headers: { 'x-forwarded-for': '203.0.113.51' },
+    })).statusCode, 201);
+  } finally {
+    await directApp.close();
+    await proxyApp.close();
+  }
+});
+
+test('failed no-availability and injected pre-commit bookings do not consume quota', async () => {
+  const { id } = await restaurant('UTC', [2]);
+  const first = await post(id, 'quota-no-availability-first');
+  assert.equal(first.statusCode, 201);
+  const unavailable = await post(id, 'quota-no-availability-retry');
+  assert.equal(unavailable.statusCode, 409);
+  assert.equal(unavailable.json().code, 'no_table_available');
+  let bucket = await pool.query('SELECT booking_count::int AS count FROM booking_rate_limit_buckets WHERE restaurant_id = $1', [id]);
+  assert.equal(bucket.rows[0].count, 1);
+  assert.equal((await reservationRequest('DELETE', first.json().id, first.json().confirmation_code)).statusCode, 200);
+  const retry = await post(id, 'quota-no-availability-retry');
+  assert.equal(retry.statusCode, 201);
+  bucket = await pool.query('SELECT booking_count::int AS count FROM booking_rate_limit_buckets WHERE restaurant_id = $1', [id]);
+  assert.equal(bucket.rows[0].count, 2);
+
+  const failingRestaurant = await restaurant();
+  await pool.query("CREATE OR REPLACE FUNCTION fail_booking_quota_test() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected reservation failure'; END $$");
+  await pool.query(`CREATE TRIGGER fail_booking_quota_test BEFORE INSERT ON reservations FOR EACH ROW WHEN (NEW.restaurant_id = '${failingRestaurant.id}'::uuid) EXECUTE FUNCTION fail_booking_quota_test()`);
+  try {
+    const failed = await post(failingRestaurant.id, 'quota-precommit-retry');
+    assert.equal(failed.statusCode, 500);
+    assert.deepEqual(failed.json(), { code: 'internal_error', message: 'An unexpected error occurred.' });
+    const state = await pool.query(
+      `SELECT (SELECT count(*)::int FROM reservations WHERE restaurant_id = $1) AS reservations,
+              (SELECT count(*)::int FROM idempotency_records WHERE restaurant_id = $1) AS idempotency,
+              (SELECT count(*)::int FROM booking_rate_limit_buckets WHERE restaurant_id = $1) AS quotas`, [failingRestaurant.id],
+    );
+    assert.deepEqual(state.rows[0], { reservations: 0, idempotency: 0, quotas: 0 });
+  } finally {
+    await pool.query('DROP TRIGGER IF EXISTS fail_booking_quota_test ON reservations');
+    await pool.query('DROP FUNCTION IF EXISTS fail_booking_quota_test()');
+  }
+  const retried = await post(failingRestaurant.id, 'quota-precommit-retry');
+  assert.equal(retried.statusCode, 201);
+  const counted = await pool.query('SELECT booking_count::int AS count FROM booking_rate_limit_buckets WHERE restaurant_id = $1', [failingRestaurant.id]);
+  assert.equal(counted.rows[0].count, 1);
+});
+
+test('quota persistence failures fail closed with 503 and roll back all booking rows', async () => {
+  const { id } = await restaurant();
+  await pool.query("CREATE OR REPLACE FUNCTION fail_booking_quota_bucket_test() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected quota persistence failure'; END $$");
+  await pool.query(`CREATE TRIGGER fail_booking_quota_bucket_test BEFORE INSERT ON booking_rate_limit_buckets FOR EACH ROW WHEN (NEW.restaurant_id = '${id}'::uuid) EXECUTE FUNCTION fail_booking_quota_bucket_test()`);
+  try {
+    const failed = await post(id, 'quota-storage-failure');
+    assert.equal(failed.statusCode, 503);
+    assert.deepEqual(failed.json(), { code: 'service_unavailable', message: 'Service temporarily unavailable.' });
+    assert.doesNotMatch(failed.body, /injected|booking_rate_limit_buckets|192\.0\.2\.1/i);
+    const state = await pool.query(
+      `SELECT (SELECT count(*)::int FROM reservations WHERE restaurant_id = $1) AS reservations,
+              (SELECT count(*)::int FROM idempotency_records WHERE restaurant_id = $1) AS idempotency,
+              (SELECT count(*)::int FROM booking_rate_limit_buckets WHERE restaurant_id = $1) AS quotas`, [id],
+    );
+    assert.deepEqual(state.rows[0], { reservations: 0, idempotency: 0, quotas: 0 });
+  } finally {
+    await pool.query('DROP TRIGGER IF EXISTS fail_booking_quota_bucket_test ON booking_rate_limit_buckets');
+    await pool.query('DROP FUNCTION IF EXISTS fail_booking_quota_bucket_test()');
+  }
+});
+
+test('quota expiry resets at the exact database boundary and Retry-After rounds up', async () => {
+  const config = loadBookingRateLimitConfig(configEnv({ BOOKING_RATE_LIMIT_MAX: '1', BOOKING_RATE_LIMIT_WINDOW_SECONDS: '60' }));
+  const limitedApp = buildApp(config, pool);
+  await limitedApp.ready();
+  try {
+    const { id } = await restaurant('UTC', [2, 2]);
+    assert.equal((await post(id, 'quota-window-first', undefined, 2, { app: limitedApp })).statusCode, 201);
+    await pool.query(
+      `UPDATE booking_rate_limit_buckets SET window_expires_at = clock_timestamp() + interval '35 seconds 200 milliseconds'
+        WHERE restaurant_id = $1`, [id],
+    );
+    const limited = await post(id, 'quota-window-limited', undefined, 2, { app: limitedApp });
+    assert.equal(limited.statusCode, 429);
+    const retryAfter = Number(limited.headers['retry-after']);
+    assert.ok(Number.isInteger(retryAfter) && retryAfter > 0);
+    const currentCeiling = await pool.query<{ seconds: number }>(
+      `SELECT ceil(extract(epoch FROM window_expires_at - clock_timestamp()))::int AS seconds
+         FROM booking_rate_limit_buckets WHERE restaurant_id = $1`, [id],
+    );
+    assert.ok(retryAfter === currentCeiling.rows[0].seconds || retryAfter === currentCeiling.rows[0].seconds + 1);
+
+    await pool.query(
+      `UPDATE booking_rate_limit_buckets
+          SET window_started_at = clock_timestamp() - interval '60 seconds', window_expires_at = clock_timestamp()
+        WHERE restaurant_id = $1`, [id],
+    );
+    const boundary = await post(id, 'quota-window-boundary', undefined, 2, { app: limitedApp });
+    assert.equal(boundary.statusCode, 201);
+    const reset = await pool.query('SELECT booking_count::int AS count FROM booking_rate_limit_buckets WHERE restaurant_id = $1', [id]);
+    assert.equal(reset.rows[0].count, 1);
+  } finally {
+    await limitedApp.close();
+  }
+});
+
+test('each quota acquisition removes at most 100 expired buckets and preserves the live bucket', async () => {
+  const { id } = await restaurant();
+  await pool.query(
+    `INSERT INTO booking_rate_limit_buckets
+       (restaurant_id, client_identity_hash, window_started_at, window_expires_at, booking_count)
+     SELECT $1, decode(lpad(to_hex(n), 64, '0'), 'hex'),
+            clock_timestamp() - interval '2 hours', clock_timestamp() - interval '1 hour', 1
+       FROM generate_series(1, 110) AS n`, [id],
+  );
+  const before = await pool.query('SELECT count(*)::int AS count FROM booking_rate_limit_buckets WHERE restaurant_id = $1 AND window_expires_at <= clock_timestamp()', [id]);
+  assert.equal(before.rows[0].count, 110);
+  const created = await post(id, 'bounded-bucket-cleanup');
+  assert.equal(created.statusCode, 201);
+  const remaining = await pool.query('SELECT count(*)::int AS count FROM booking_rate_limit_buckets WHERE restaurant_id = $1 AND window_expires_at <= clock_timestamp()', [id]);
+  assert.ok(remaining.rows[0].count >= 10 && remaining.rows[0].count <= 110);
+  assert.ok(110 - remaining.rows[0].count <= 100);
+  const live = await pool.query(
+    `SELECT count(*)::int AS count FROM booking_rate_limit_buckets
+      WHERE restaurant_id = $1 AND client_identity_hash = $2 AND window_expires_at > clock_timestamp()`,
+    [id, clientIdentityHash('192.0.2.1', testConfig.hmacSecret)],
+  );
+  assert.equal(live.rows[0].count, 1);
 });
 
 test('restaurant and table persistence, validation, and uniqueness constraints', async () => {
@@ -190,7 +527,7 @@ test('candidate fallback handles a reservation committed while its table row is 
       return Reflect.get(target, property, receiver);
     },
   });
-  const raceApp = buildApp(racingPool);
+  const raceApp = buildApp(testConfig, racingPool);
   await raceApp.ready();
   const blocker = await pool.connect();
   let transactionOpen = false;

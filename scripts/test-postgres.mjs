@@ -47,19 +47,32 @@ try {
       `INSERT INTO idempotency_records (restaurant_id, idempotency_key, request_fingerprint, reservation_id, outcome)
        VALUES ($1, 'fixture-key', 'fixture-fingerprint', $2, '{"id":"fixture"}')`, [restaurantId, reservation.rows[0].id],
     );
-    const snapshot = async () => {
+    const snapshot = async (tables) => {
       const result = {};
-      for (const name of ['restaurants', 'dining_tables', 'reservations', 'idempotency_records']) {
+      for (const name of tables) {
         const rows = await upgrade.query(`SELECT to_jsonb(row_data) AS row FROM ${name} AS row_data ORDER BY to_jsonb(row_data)::text`);
         result[name] = rows.rows;
       }
       return result;
     };
-    const before = await snapshot();
+    const stageOneTables = ['restaurants', 'dining_tables', 'reservations', 'idempotency_records'];
+    const beforeStageOne = await snapshot(stageOneTables);
     await upgrade.query(await readFile('migrations/002_reservation_access_failures.sql', 'utf8'));
-    const after = await snapshot();
-    if (JSON.stringify(after) !== JSON.stringify(before)) throw new Error('Migration 002 changed pre-existing Stage 1 rows.');
-    console.log('Migration upgrade verified: populated migration 001 rows unchanged after migration 002.');
+    const afterStageTwoMigration = await snapshot(stageOneTables);
+    if (JSON.stringify(afterStageTwoMigration) !== JSON.stringify(beforeStageOne)) throw new Error('Migration 002 changed pre-existing Stage 1 rows.');
+    await upgrade.query(
+      `INSERT INTO reservation_access_failures (reservation_id, failure_count, window_started)
+       VALUES ($1, 3, clock_timestamp())`, [reservation.rows[0].id],
+    );
+    const stageTwoTables = [...stageOneTables, 'reservation_access_failures'];
+    const stageTwoSnapshot = await snapshot(stageTwoTables);
+    await upgrade.query(await readFile('migrations/003_booking_rate_limits.sql', 'utf8'));
+    const after = await snapshot(stageTwoTables);
+    if (JSON.stringify(after) !== JSON.stringify(stageTwoSnapshot)) throw new Error('Migration 003 changed pre-existing Stage 1/2 rows.');
+    const buckets = await upgrade.query('SELECT count(*)::int AS count FROM booking_rate_limit_buckets');
+    if (buckets.rows[0].count !== 0) throw new Error('Migration 003 unexpectedly created booking quota rows.');
+    console.log('Migration upgrade verified: populated migrations 001/002 fixtures (including reservation access failures) unchanged after migration 003.');
+    console.log('Migration 003 created an empty booking_rate_limit_buckets table; all pre-existing restaurant, table, reservation, idempotency, and access-failure rows match.');
   } finally {
     await upgrade.end();
   }
