@@ -1,4 +1,4 @@
-import { createHash, randomBytes } from 'node:crypto';
+import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
 import Fastify, { type FastifyInstance } from 'fastify';
 import type { Pool } from 'pg';
 import { pool } from './db.js';
@@ -18,6 +18,63 @@ type ReservationBody = {
   ends_at: string;
   timezone: string;
 };
+
+const RESERVATION_NOT_FOUND = { code: 'reservation_not_found', message: 'Reservation not found.' } as const;
+const RATE_LIMITED = { code: 'rate_limited', message: 'Too many failed confirmation code attempts.' } as const;
+const FAILURE_LIMIT = 5;
+
+function confirmationCodeMatches(supplied: unknown, expected: string): boolean {
+  const valid = typeof supplied === 'string' && /^[0-9a-f]{12}$/i.test(supplied);
+  const candidate = Buffer.from(valid ? (supplied as string).toUpperCase() : '000000000000', 'ascii');
+  const expectedBytes = Buffer.from(expected, 'ascii');
+  const candidateDigest = createHash('sha256').update(candidate).digest();
+  const expectedDigest = createHash('sha256').update(expectedBytes).digest();
+  return valid && timingSafeEqual(candidateDigest, expectedDigest);
+}
+
+type AccessRow = {
+  id: string; confirmation_code: string; status: 'confirmed' | 'cancelled'; party_size: number;
+  capacity: number; starts_at: string | Date; ends_at: string | Date; timezone: string;
+};
+
+async function authorizedReservation(client: import('pg').PoolClient, id: string, supplied: unknown): Promise<
+  { row: AccessRow; authorized: true } | { authorized: false; limited: boolean; retryAfter?: number }
+> {
+  const selected = await client.query<AccessRow>(
+    `SELECT r.id, r.confirmation_code, r.status, r.party_size, t.capacity, r.starts_at, r.ends_at, s.timezone
+       FROM reservations r JOIN dining_tables t ON t.id = r.table_id
+       JOIN restaurants s ON s.id = r.restaurant_id WHERE r.id = $1 FOR UPDATE OF r`, [id],
+  );
+  if (!selected.rowCount) return { authorized: false, limited: false };
+
+  // The reservation row lock serializes both failures and successful resets across app instances.
+  await client.query(
+    `DELETE FROM reservation_access_failures
+      WHERE reservation_id = $1 AND window_started <= clock_timestamp() - interval '15 minutes'`, [id],
+  );
+  const failures = await client.query<{ failure_count: number; remaining_ms: number }>(
+    `SELECT failure_count,
+            ceil(extract(epoch FROM window_started + interval '15 minutes' - clock_timestamp()) * 1000)::int AS remaining_ms
+       FROM reservation_access_failures WHERE reservation_id = $1 FOR UPDATE`, [id],
+  );
+  if (failures.rowCount && failures.rows[0].failure_count >= FAILURE_LIMIT) {
+    return { authorized: false, limited: true, retryAfter: Math.max(1, Math.ceil(failures.rows[0].remaining_ms / 1000)) };
+  }
+
+  const row = selected.rows[0];
+  if (confirmationCodeMatches(supplied, row.confirmation_code)) {
+    await client.query('DELETE FROM reservation_access_failures WHERE reservation_id = $1', [id]);
+    return { row, authorized: true };
+  }
+
+  await client.query(
+    `INSERT INTO reservation_access_failures (reservation_id, failure_count, window_started)
+     VALUES ($1, 1, clock_timestamp())
+     ON CONFLICT (reservation_id) DO UPDATE SET failure_count = LEAST(reservation_access_failures.failure_count + 1, $2)`,
+    [id, FAILURE_LIMIT],
+  );
+  return { authorized: false, limited: false };
+}
 
 function invalid(message: string): never { throw new ApiError(422, 'invalid_input', message); }
 
@@ -224,27 +281,42 @@ export function buildApp(db: Pool = pool): FastifyInstance {
 
   app.get<{ Params: { reservation_id: string } }>('/reservations/:reservation_id', async (request, reply) => {
     assertId(request.params.reservation_id);
-    const rows = await db.query(
-      `SELECT r.id, r.confirmation_code, r.status, r.party_size, t.capacity, r.starts_at, r.ends_at, s.timezone
-         FROM reservations r JOIN dining_tables t ON t.id = r.table_id
-         JOIN restaurants s ON s.id = r.restaurant_id WHERE r.id = $1`, [request.params.reservation_id],
-    );
-    if (!rows.rowCount) throw new ApiError(404, 'reservation_not_found', 'Reservation not found.');
-    return reply.send(reservationBody(rows.rows[0]));
+    const client = await db.connect();
+    let transactionOpen = false;
+    try {
+      await client.query('BEGIN');
+      transactionOpen = true;
+      const result = await authorizedReservation(client, request.params.reservation_id, request.headers['reservation-confirmation-code']);
+      await client.query('COMMIT');
+      transactionOpen = false;
+      if (!result.authorized) {
+        if (result.limited) return reply.header('Retry-After', String(result.retryAfter)).code(429).send(RATE_LIMITED);
+        return reply.code(404).send(RESERVATION_NOT_FOUND);
+      }
+      return reply.send(reservationBody(result.row));
+    } catch (error) {
+      if (transactionOpen) await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
   });
 
   app.delete<{ Params: { reservation_id: string } }>('/reservations/:reservation_id', async (request, reply) => {
     assertId(request.params.reservation_id);
     const client = await db.connect();
+    let transactionOpen = false;
     try {
       await client.query('BEGIN');
-      const rows = await client.query(
-        `SELECT r.id, r.confirmation_code, r.status, r.party_size, t.capacity, r.starts_at, r.ends_at, s.timezone
-           FROM reservations r JOIN dining_tables t ON t.id = r.table_id
-           JOIN restaurants s ON s.id = r.restaurant_id WHERE r.id = $1 FOR UPDATE OF r`, [request.params.reservation_id],
-      );
-      if (!rows.rowCount) throw new ApiError(404, 'reservation_not_found', 'Reservation not found.');
-      let row = rows.rows[0];
+      transactionOpen = true;
+      const result = await authorizedReservation(client, request.params.reservation_id, request.headers['reservation-confirmation-code']);
+      if (!result.authorized) {
+        await client.query('COMMIT');
+        transactionOpen = false;
+        if (result.limited) return reply.header('Retry-After', String(result.retryAfter)).code(429).send(RATE_LIMITED);
+        return reply.code(404).send(RESERVATION_NOT_FOUND);
+      }
+      let row = result.row;
       if (row.status === 'confirmed') {
         const update = await client.query(
           `UPDATE reservations SET status = 'cancelled', cancelled_at = now()
@@ -254,9 +326,10 @@ export function buildApp(db: Pool = pool): FastifyInstance {
         row = { ...row, ...update.rows[0] };
       }
       await client.query('COMMIT');
+      transactionOpen = false;
       return reply.code(200).send(reservationBody(row));
     } catch (error) {
-      await client.query('ROLLBACK');
+      if (transactionOpen) await client.query('ROLLBACK');
       throw error;
     } finally {
       client.release();

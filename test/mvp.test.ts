@@ -26,6 +26,10 @@ function post(id: string, key: string, startsAt = '2026-01-15T19:00', size = 2) 
   return app.inject({ method: 'POST', url: `/restaurants/${id}/reservations`, headers: { 'idempotency-key': key }, payload: { party_size: size, starts_at_local: startsAt } });
 }
 
+function reservationRequest(method: 'GET' | 'DELETE', id: string, code: string) {
+  return app.inject({ method, url: `/reservations/${id}`, headers: { 'reservation-confirmation-code': code } });
+}
+
 test('invalid requests keep safe structured 4xx status codes, including oversized JSON', async () => {
   const { id } = await restaurant();
   const invalidId = await app.inject('/restaurants/not-a-uuid');
@@ -92,7 +96,7 @@ test('availability respects capacity, active reservations, half-open boundary, a
   assert.equal(booking.statusCode, 201);
   assert.equal((await available('19:00')).json().available, false);
   assert.equal((await available('21:00')).json().available, true);
-  assert.equal((await app.inject({ method: 'DELETE', url: `/reservations/${booking.json().id}` })).statusCode, 200);
+  assert.equal((await reservationRequest('DELETE', booking.json().id, booking.json().confirmation_code)).statusCode, 200);
   assert.equal((await available('19:00')).json().available, true);
 });
 
@@ -241,14 +245,108 @@ test('no availability does not retain an idempotency key after transaction rollb
 test('cancellation is stable and releases the table for rebooking', async () => {
   const { id } = await restaurant('UTC', [2]);
   const created = await post(id, 'cancel-1');
-  const url = `/reservations/${created.json().id}`;
-  const concurrent = await Promise.all(Array.from({ length: 8 }, () => app.inject({ method: 'DELETE', url })));
+  const concurrent = await Promise.all(Array.from({ length: 8 }, () => reservationRequest('DELETE', created.json().id, created.json().confirmation_code)));
   const cancelled = concurrent[0];
   assert.ok(concurrent.every((response) => response.statusCode === 200));
   assert.ok(concurrent.every((response) => response.json().status === 'cancelled'));
   assert.ok(concurrent.every((response) => JSON.stringify(response.json()) === JSON.stringify(cancelled.json())));
   assert.equal((await post(id, 'cancel-2')).statusCode, 201);
-  assert.equal((await app.inject(url)).json().status, 'cancelled');
+  assert.equal((await reservationRequest('GET', created.json().id, created.json().confirmation_code)).json().status, 'cancelled');
+});
+
+test('reservation access requires a matching code and hides unknown versus incorrect credentials', async () => {
+  const { id } = await restaurant();
+  const created = await post(id, 'access-contract');
+  const reservationId = created.json().id as string;
+  const expected = { code: 'reservation_not_found', message: 'Reservation not found.' };
+  const unknown = await reservationRequest('GET', randomUUID(), created.json().confirmation_code);
+  const missing = await app.inject(`/reservations/${reservationId}`);
+  const malformed = await reservationRequest('GET', reservationId, 'not-a-code');
+  const wrong = await reservationRequest('DELETE', reservationId, 'FFFFFFFFFFFF');
+  for (const response of [unknown, missing, malformed, wrong]) {
+    assert.equal(response.statusCode, 404);
+    assert.deepEqual(response.json(), expected);
+    assert.doesNotMatch(response.body, /confirmation_code|party_size|table_capacity|starts_at|timezone/i);
+  }
+  const stillConfirmed = await pool.query('SELECT status FROM reservations WHERE id = $1', [reservationId]);
+  assert.equal(stillConfirmed.rows[0].status, 'confirmed');
+  const valid = await reservationRequest('GET', reservationId, (created.json().confirmation_code as string).toLowerCase());
+  assert.equal(valid.statusCode, 200);
+  assert.deepEqual(valid.json(), created.json());
+});
+
+test('failed credentials throttle atomically, correct credentials reset, and reservations are isolated', async () => {
+  const { id } = await restaurant();
+  const first = await post(id, 'throttle-first');
+  const second = await post(id, 'throttle-second', '2026-01-15T21:00');
+  const reservationId = first.json().id as string;
+  const badRequests = await Promise.all(Array.from({ length: 12 }, () => reservationRequest('GET', reservationId, 'FFFFFFFFFFFF')));
+  assert.equal(badRequests.filter((r) => r.statusCode === 404).length, 5);
+  assert.equal(badRequests.filter((r) => r.statusCode === 429).length, 7);
+  const limited = badRequests.find((r) => r.statusCode === 429)!;
+  assert.deepEqual(limited.json(), { code: 'rate_limited', message: 'Too many failed confirmation code attempts.' });
+  assert.ok(Number(limited.headers['retry-after']) > 0);
+  assert.equal((await reservationRequest('GET', second.json().id, 'FFFFFFFFFFFF')).statusCode, 404);
+  assert.equal((await reservationRequest('GET', reservationId, first.json().confirmation_code)).statusCode, 429);
+
+  await pool.query("UPDATE reservation_access_failures SET window_started = clock_timestamp() - interval '16 minutes' WHERE reservation_id = $1", [reservationId]);
+  const afterExpiry = await reservationRequest('GET', reservationId, 'FFFFFFFFFFFF');
+  assert.equal(afterExpiry.statusCode, 404);
+  assert.equal((await reservationRequest('GET', reservationId, first.json().confirmation_code)).statusCode, 200);
+  assert.equal((await pool.query('SELECT count(*)::int AS count FROM reservation_access_failures WHERE reservation_id = $1', [reservationId])).rows[0].count, 0);
+});
+
+test('correct authorization clears failed attempts and concurrent authorized DELETE retries are stable', async () => {
+  const { id } = await restaurant('UTC', [2]);
+  const created = await post(id, 'authorized-delete');
+  const reservationId = created.json().id as string;
+  await reservationRequest('GET', reservationId, 'FFFFFFFFFFFF');
+  assert.equal((await pool.query('SELECT failure_count FROM reservation_access_failures WHERE reservation_id = $1', [reservationId])).rows[0].failure_count, 1);
+  const concurrent = await Promise.all(Array.from({ length: 8 }, () => reservationRequest('DELETE', reservationId, created.json().confirmation_code)));
+  assert.ok(concurrent.every((response) => response.statusCode === 200));
+  assert.ok(concurrent.every((response) => JSON.stringify(response.json()) === JSON.stringify(concurrent[0].json())));
+  assert.equal((await pool.query('SELECT count(*)::int AS count FROM reservation_access_failures WHERE reservation_id = $1', [reservationId])).rows[0].count, 0);
+  assert.equal((await post(id, 'authorized-delete-rebook')).statusCode, 201);
+});
+
+test('a valid cancellation racing with failed credentials is serialized and cannot be lost', async () => {
+  const { id } = await restaurant();
+  const created = await post(id, 'authorization-race');
+  const reservationId = created.json().id as string;
+  const blocker = await pool.connect();
+  let transactionOpen = false;
+  try {
+    await blocker.query('BEGIN');
+    transactionOpen = true;
+    await blocker.query('SELECT id FROM reservations WHERE id = $1 FOR UPDATE', [reservationId]);
+    const valid = reservationRequest('DELETE', reservationId, created.json().confirmation_code);
+    let validRequestWaiting = false;
+    for (let attempt = 0; attempt < 300; attempt += 1) {
+      const waiting = await pool.query<{ count: number }>(
+        `SELECT count(*)::int AS count FROM pg_stat_activity
+          WHERE datname = current_database() AND wait_event_type = 'Lock'
+            AND query LIKE 'SELECT r.id, r.confirmation_code%'`,
+      );
+      if (waiting.rows[0].count > 0) { validRequestWaiting = true; break; }
+      await delay(10);
+    }
+    assert.equal(validRequestWaiting, true, 'authorized DELETE should wait behind the held reservation lock');
+    const invalid = Promise.all(Array.from({ length: 8 }, () => reservationRequest('GET', reservationId, 'FFFFFFFFFFFF')));
+    await blocker.query('COMMIT');
+    transactionOpen = false;
+    const [authorized, failures] = await Promise.all([valid, invalid]);
+    assert.equal(authorized.statusCode, 200);
+    assert.equal(authorized.json().status, 'cancelled');
+    assert.equal(failures.filter((response) => response.statusCode === 404).length, 5);
+    assert.equal(failures.filter((response) => response.statusCode === 429).length, 3);
+  } finally {
+    if (transactionOpen) await blocker.query('ROLLBACK');
+    blocker.release();
+  }
+  const stored = await pool.query('SELECT status FROM reservations WHERE id = $1', [reservationId]);
+  assert.equal(stored.rows[0].status, 'cancelled');
+  const failures = await pool.query('SELECT failure_count FROM reservation_access_failures WHERE reservation_id = $1', [reservationId]);
+  assert.equal(failures.rowCount === 0 || (failures.rows[0].failure_count >= 1 && failures.rows[0].failure_count <= 5), true);
 });
 
 test('DST gaps and folds are rejected; booking duration is elapsed time across DST', async () => {
