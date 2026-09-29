@@ -1,0 +1,3 @@
+Stage 3 implementation and tests reviewed at: 257a6c23f59c5f015c75e7a412b49d0e5888b5ef
+Reviewer decision: RELEASE PASS
+Snapshot contents copied from the reviewed implementation commit.
