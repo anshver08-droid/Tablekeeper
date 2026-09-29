@@ -1,0 +1,44 @@
+TableKeeper Stage 2 submission verification
+============================================
+
+Reviewed implementation/test revision:
+9e97ae2ce14181286be1babe1b1a875f6ae127bc
+
+Commands run from the repository root after creating the complete Stage 2 package, including this evidence file:
+
+$ npm ci
+added 74 packages, and audited 75 packages in 7s
+19 packages are looking for funding
+found 0 vulnerabilities
+Exit code: 0
+
+$ npm run test:postgres
+PostgreSQL acceptance database ready.
+Migration upgrade verified: populated migration 001 rows unchanged after migration 002.
+TAP: tests 18; pass 18; fail 0; cancelled 0; skipped 0; todo 0.
+Exit code: 0
+
+$ npm run typecheck
+> tsc --noEmit
+Exit code: 0
+
+$ git diff --check
+No output.
+Exit code: 0
+
+$ git diff --exit-code -- stage-1/ migrations/001_initial.sql
+No output; Stage 1 and migration 001 are unchanged.
+Exit code: 0
+
+$ git status --short
+?? stage-2/
+Exit code: 0 (the package directory was untracked at the time; it is included in the submission commit)
+
+Snapshot check:
+PowerShell SHA-256 comparison of 14 copied project files against the root implementation.
+Output: Snapshot matches root files: 14 files
+Exit code: 0
+
+Reviewer decision:
+RELEASE PASS for Stage 2 implementation snapshot at 9e97ae2ce14181286be1babe1b1a875f6ae127bc.
+The Reviewer confirmed the missing-code DELETE test proves identical generic 404 responses to missing-code GET and unchanged reservation state, and reran the PostgreSQL suite with all 18 tests passing.
