@@ -4,13 +4,14 @@ import { loadBookingRateLimitConfig } from './booking-rate-limit.js';
 
 async function start(): Promise<void> {
   let rateLimitConfig;
-  try { rateLimitConfig = loadBookingRateLimitConfig(); }
-  catch {
-    console.error('Invalid booking rate-limit configuration.');
-    await pool.end();
-    process.exitCode = 1;
-    return;
-  }
+try {
+  rateLimitConfig = loadBookingRateLimitConfig();
+} catch (error) {
+  console.error('Invalid booking rate-limit configuration:', error);
+  await pool.end();
+  process.exitCode = 1;
+  return;
+}
 
   let app: ReturnType<typeof buildApp>;
   try { app = buildApp(rateLimitConfig); }

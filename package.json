@@ -4,10 +4,10 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "tsx watch src/server.ts",
-    "start": "tsx src/server.ts",
-    "migrate": "tsx src/migrate.ts",
-    "seed": "tsx scripts/seed.ts",
+    "dev": "tsx watch --env-file=.env src/server.ts",
+    "start": "tsx --env-file=.env src/server.ts",
+    "migrate": "tsx --env-file=.env src/migrate.ts",
+    "seed": "tsx --env-file=.env scripts/seed.ts",
     "test": "tsx --test test/mvp.test.ts",
     "test:postgres": "node scripts/test-postgres.mjs",
     "typecheck": "tsc --noEmit"
