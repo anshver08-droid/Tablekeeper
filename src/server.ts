@@ -26,9 +26,10 @@ try {
 
   try {
     await app.listen({ host, port });
-    app.log.info(`TableKeeper listening on http://${host}:${port}`);
+    console.log(`🚀 TableKeeper listening on http://${host}:${port}`);
+    console.log(`👉 Web Interface: http://localhost:${port}`);
   } catch (error) {
-    app.log.error(error);
+    console.error('Failed to start TableKeeper server:', error);
     await pool.end();
     process.exitCode = 1;
     return;

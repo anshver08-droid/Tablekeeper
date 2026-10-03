@@ -1,0 +1,1853 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>TableKeeper &mdash; Conflict-Free Restaurant Reservations</title>
+  <meta name="description"
+    content="Conflict-free restaurant reservations with strict PostgreSQL transactional guarantees and email-verified guest booking.">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link
+    href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&family=Outfit:wght@500;600;700;800&display=swap"
+    rel="stylesheet">
+  <style>
+    :root {
+      --bg-base: #090d16;
+      --bg-surface: #0f172a;
+      --bg-surface-elevated: #1e293b;
+      --bg-glass: rgba(15, 23, 42, 0.75);
+      --border-subtle: rgba(255, 255, 255, 0.08);
+      --border-focus: rgba(99, 102, 241, 0.5);
+      --text-primary: #f8fafc;
+      --text-secondary: #94a3b8;
+      --text-muted: #64748b;
+      --accent-primary: #6366f1;
+      --accent-primary-hover: #4f46e5;
+      --accent-emerald: #10b981;
+      --accent-emerald-glow: rgba(16, 185, 129, 0.2);
+      --accent-amber: #f59e0b;
+      --accent-rose: #f43f5e;
+      --accent-rose-glow: rgba(244, 63, 94, 0.2);
+      --accent-cyan: #06b6d4;
+      --radius-sm: 8px;
+      --radius-md: 12px;
+      --radius-lg: 18px;
+      --radius-xl: 24px;
+      --shadow-subtle: 0 4px 20px -2px rgba(0, 0, 0, 0.5);
+      --shadow-glow: 0 0 35px -5px rgba(99, 102, 241, 0.25);
+    }
+
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+
+    body {
+      background-color: var(--bg-base);
+      background-image:
+        radial-gradient(at 10% 20%, rgba(99, 102, 241, 0.12) 0px, transparent 50%),
+        radial-gradient(at 90% 80%, rgba(16, 185, 129, 0.08) 0px, transparent 50%),
+        radial-gradient(at 50% 50%, rgba(6, 182, 212, 0.05) 0px, transparent 60%);
+      color: var(--text-primary);
+      font-family: 'Inter', system-ui, -apple-system, sans-serif;
+      line-height: 1.5;
+      min-height: 100vh;
+      overflow-x: hidden;
+      padding-bottom: 80px;
+    }
+
+    /* Top Navigation */
+    header {
+      position: sticky;
+      top: 0;
+      z-index: 50;
+      backdrop-filter: blur(16px);
+      -webkit-backdrop-filter: blur(16px);
+      background: var(--bg-glass);
+      border-bottom: 1px solid var(--border-subtle);
+    }
+
+    .nav-container {
+      max-width: 1200px;
+      margin: 0 auto;
+      padding: 16px 24px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      text-decoration: none;
+      color: var(--text-primary);
+    }
+
+    .brand-icon {
+      width: 40px;
+      height: 40px;
+      border-radius: var(--radius-md);
+      background: linear-gradient(135deg, #6366f1, #a855f7);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 20px;
+      box-shadow: 0 0 15px rgba(99, 102, 241, 0.4);
+    }
+
+    .brand-title {
+      font-family: 'Outfit', sans-serif;
+      font-size: 22px;
+      font-weight: 700;
+      letter-spacing: -0.5px;
+      background: linear-gradient(135deg, #ffffff 40%, #a5b4fc);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+    }
+
+    .nav-tabs {
+      display: flex;
+      gap: 8px;
+      background: rgba(0, 0, 0, 0.3);
+      padding: 4px;
+      border-radius: var(--radius-lg);
+      border: 1px solid var(--border-subtle);
+    }
+
+    .nav-tab-btn {
+      background: transparent;
+      border: none;
+      color: var(--text-secondary);
+      padding: 8px 18px;
+      font-size: 14px;
+      font-weight: 500;
+      border-radius: var(--radius-md);
+      cursor: pointer;
+      transition: all 0.2s ease;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .nav-tab-btn:hover {
+      color: var(--text-primary);
+      background: rgba(255, 255, 255, 0.05);
+    }
+
+    .nav-tab-btn.active {
+      color: #fff;
+      background: var(--accent-primary);
+      box-shadow: 0 2px 10px rgba(99, 102, 241, 0.3);
+    }
+
+    .server-status {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 13px;
+      color: var(--text-secondary);
+      background: rgba(16, 185, 129, 0.1);
+      border: 1px solid rgba(16, 185, 129, 0.3);
+      padding: 6px 14px;
+      border-radius: 9999px;
+    }
+
+    .status-dot {
+      width: 8px;
+      height: 8px;
+      background: var(--accent-emerald);
+      border-radius: 50%;
+      box-shadow: 0 0 8px var(--accent-emerald);
+      animation: pulse 2s infinite;
+    }
+
+    @keyframes pulse {
+
+      0%,
+      100% {
+        opacity: 1;
+        transform: scale(1);
+      }
+
+      50% {
+        opacity: 0.5;
+        transform: scale(0.85);
+      }
+    }
+
+    /* Container */
+    .main-container {
+      max-width: 1200px;
+      margin: 0 auto;
+      padding: 32px 24px;
+    }
+
+    /* Hero Section */
+    .hero {
+      text-align: center;
+      margin-bottom: 40px;
+      padding: 20px 0;
+    }
+
+    .hero-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 6px 14px;
+      border-radius: 9999px;
+      background: rgba(99, 102, 241, 0.15);
+      border: 1px solid rgba(99, 102, 241, 0.3);
+      color: #a5b4fc;
+      font-size: 13px;
+      font-weight: 600;
+      margin-bottom: 16px;
+    }
+
+    .hero-title {
+      font-family: 'Outfit', sans-serif;
+      font-size: 44px;
+      font-weight: 800;
+      letter-spacing: -1px;
+      line-height: 1.15;
+      margin-bottom: 14px;
+    }
+
+    .hero-title span {
+      background: linear-gradient(135deg, #818cf8, #c084fc, #38bdf8);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+    }
+
+    .hero-desc {
+      color: var(--text-secondary);
+      font-size: 17px;
+      max-width: 680px;
+      margin: 0 auto 24px;
+    }
+
+    .guarantees-bar {
+      display: flex;
+      justify-content: center;
+      flex-wrap: wrap;
+      gap: 20px;
+      margin-top: 16px;
+    }
+
+    .guarantee-item {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 13px;
+      color: var(--text-muted);
+    }
+
+    .guarantee-item svg {
+      color: var(--accent-emerald);
+      width: 16px;
+      height: 16px;
+    }
+
+    /* Card System */
+    .card {
+      background: var(--bg-surface);
+      border: 1px solid var(--border-subtle);
+      border-radius: var(--radius-xl);
+      padding: 32px;
+      box-shadow: var(--shadow-subtle);
+      position: relative;
+    }
+
+    .card-glass {
+      background: var(--bg-glass);
+      backdrop-filter: blur(20px);
+      -webkit-backdrop-filter: blur(20px);
+      border: 1px solid var(--border-subtle);
+    }
+
+    .card-header {
+      margin-bottom: 24px;
+    }
+
+    .card-title {
+      font-family: 'Outfit', sans-serif;
+      font-size: 24px;
+      font-weight: 700;
+      margin-bottom: 6px;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+
+    .card-subtitle {
+      color: var(--text-secondary);
+      font-size: 14px;
+    }
+
+    /* Step Wizard */
+    .wizard-steps {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 36px;
+      position: relative;
+    }
+
+    .wizard-steps::before {
+      content: '';
+      position: absolute;
+      top: 20px;
+      left: 30px;
+      right: 30px;
+      height: 2px;
+      background: rgba(255, 255, 255, 0.08);
+      z-index: 1;
+    }
+
+    .wizard-step {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      position: relative;
+      z-index: 2;
+      background: var(--bg-surface);
+      padding: 0 10px;
+      cursor: pointer;
+    }
+
+    .step-circle {
+      width: 40px;
+      height: 40px;
+      border-radius: 50%;
+      background: var(--bg-surface-elevated);
+      border: 2px solid var(--border-subtle);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-weight: 700;
+      font-size: 15px;
+      color: var(--text-muted);
+      margin-bottom: 8px;
+      transition: all 0.3s ease;
+    }
+
+    .wizard-step.active .step-circle {
+      background: var(--accent-primary);
+      border-color: #818cf8;
+      color: #fff;
+      box-shadow: 0 0 16px rgba(99, 102, 241, 0.5);
+    }
+
+    .wizard-step.completed .step-circle {
+      background: var(--accent-emerald);
+      border-color: #34d399;
+      color: #fff;
+      box-shadow: 0 0 16px rgba(16, 185, 129, 0.3);
+    }
+
+    .step-label {
+      font-size: 13px;
+      font-weight: 600;
+      color: var(--text-muted);
+      transition: color 0.3s ease;
+    }
+
+    .wizard-step.active .step-label {
+      color: #fff;
+    }
+
+    .wizard-step.completed .step-label {
+      color: var(--accent-emerald);
+    }
+
+    /* Forms & Inputs */
+    .form-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+      gap: 20px;
+      margin-bottom: 24px;
+    }
+
+    .form-group {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+
+    .form-label {
+      font-size: 13px;
+      font-weight: 600;
+      color: var(--text-secondary);
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+
+    .form-input,
+    .form-select {
+      background: var(--bg-surface-elevated);
+      border: 1px solid var(--border-subtle);
+      border-radius: var(--radius-md);
+      padding: 12px 16px;
+      color: var(--text-primary);
+      font-family: inherit;
+      font-size: 15px;
+      outline: none;
+      transition: all 0.2s ease;
+      width: 100%;
+    }
+
+    .form-input:focus,
+    .form-select:focus {
+      border-color: var(--border-focus);
+      box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.15);
+    }
+
+    /* Party Size Chip Selectors */
+    .party-chips {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+
+    .party-chip {
+      background: var(--bg-surface-elevated);
+      border: 1px solid var(--border-subtle);
+      border-radius: var(--radius-sm);
+      padding: 8px 16px;
+      font-size: 14px;
+      font-weight: 600;
+      color: var(--text-secondary);
+      cursor: pointer;
+      transition: all 0.2s ease;
+      user-select: none;
+    }
+
+    .party-chip:hover {
+      color: var(--text-primary);
+      border-color: rgba(255, 255, 255, 0.2);
+    }
+
+    .party-chip.selected {
+      background: var(--accent-primary);
+      border-color: #818cf8;
+      color: #fff;
+      box-shadow: 0 2px 8px rgba(99, 102, 241, 0.3);
+    }
+
+    /* Buttons */
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      background: var(--accent-primary);
+      color: #fff;
+      font-family: inherit;
+      font-size: 15px;
+      font-weight: 600;
+      padding: 12px 24px;
+      border-radius: var(--radius-md);
+      border: none;
+      cursor: pointer;
+      transition: all 0.2s ease;
+      text-decoration: none;
+    }
+
+    .btn:hover:not(:disabled) {
+      background: var(--accent-primary-hover);
+      transform: translateY(-1px);
+      box-shadow: 0 4px 14px rgba(99, 102, 241, 0.4);
+    }
+
+    .btn:active:not(:disabled) {
+      transform: translateY(0);
+    }
+
+    .btn:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+      transform: none;
+    }
+
+    .btn-secondary {
+      background: var(--bg-surface-elevated);
+      border: 1px solid var(--border-subtle);
+      color: var(--text-primary);
+    }
+
+    .btn-secondary:hover:not(:disabled) {
+      background: rgba(255, 255, 255, 0.1);
+      box-shadow: none;
+    }
+
+    .btn-danger {
+      background: var(--accent-rose);
+      color: #fff;
+    }
+
+    .btn-danger:hover:not(:disabled) {
+      background: #e11d48;
+      box-shadow: 0 4px 14px var(--accent-rose-glow);
+    }
+
+    .btn-success {
+      background: var(--accent-emerald);
+      color: #fff;
+    }
+
+    .btn-success:hover:not(:disabled) {
+      background: #059669;
+      box-shadow: 0 4px 14px var(--accent-emerald-glow);
+    }
+
+    /* Live Availability Pill */
+    .availability-banner {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      padding: 14px 18px;
+      border-radius: var(--radius-md);
+      margin-bottom: 24px;
+      font-size: 14px;
+      transition: all 0.3s ease;
+    }
+
+    .availability-banner.checking {
+      background: rgba(99, 102, 241, 0.1);
+      border: 1px solid rgba(99, 102, 241, 0.2);
+      color: #a5b4fc;
+    }
+
+    .availability-banner.available {
+      background: rgba(16, 185, 129, 0.12);
+      border: 1px solid rgba(16, 185, 129, 0.3);
+      color: #34d399;
+    }
+
+    .availability-banner.unavailable {
+      background: rgba(244, 63, 94, 0.12);
+      border: 1px solid rgba(244, 63, 94, 0.3);
+      color: #fb7185;
+    }
+
+    /* OTP Inputs */
+    .otp-container {
+      display: flex;
+      gap: 10px;
+      justify-content: center;
+      margin: 20px 0;
+    }
+
+    .otp-input {
+      width: 52px;
+      height: 60px;
+      text-align: center;
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 26px;
+      font-weight: 700;
+      background: var(--bg-surface-elevated);
+      border: 2px solid var(--border-subtle);
+      border-radius: var(--radius-md);
+      color: #fff;
+      outline: none;
+      transition: all 0.2s ease;
+    }
+
+    .otp-input:focus {
+      border-color: var(--accent-primary);
+      box-shadow: 0 0 12px rgba(99, 102, 241, 0.3);
+      transform: scale(1.05);
+    }
+
+    /* Confirmation Receipt Card */
+    .receipt-card {
+      background: linear-gradient(180deg, rgba(30, 41, 59, 0.7) 0%, rgba(15, 23, 42, 0.9) 100%);
+      border: 1px solid rgba(16, 185, 129, 0.3);
+      border-radius: var(--radius-xl);
+      padding: 36px;
+      text-align: center;
+      position: relative;
+      overflow: hidden;
+      box-shadow: 0 0 40px rgba(16, 185, 129, 0.15);
+    }
+
+    .receipt-badge {
+      width: 64px;
+      height: 64px;
+      background: linear-gradient(135deg, #10b981, #059669);
+      border-radius: 50%;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 32px;
+      margin: 0 auto 16px;
+      box-shadow: 0 0 20px rgba(16, 185, 129, 0.4);
+    }
+
+    .code-display-box {
+      background: rgba(0, 0, 0, 0.4);
+      border: 1px dashed rgba(255, 255, 255, 0.2);
+      border-radius: var(--radius-md);
+      padding: 16px;
+      margin: 20px auto;
+      max-width: 420px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+
+    .code-text {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 24px;
+      font-weight: 700;
+      letter-spacing: 2px;
+      color: #38bdf8;
+    }
+
+    .receipt-details {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+      gap: 16px;
+      margin: 24px 0;
+      text-align: left;
+      background: rgba(0, 0, 0, 0.2);
+      padding: 20px;
+      border-radius: var(--radius-md);
+    }
+
+    .receipt-detail-item {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+
+    .receipt-detail-label {
+      font-size: 12px;
+      color: var(--text-muted);
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+    }
+
+    .receipt-detail-value {
+      font-size: 15px;
+      font-weight: 600;
+      color: var(--text-primary);
+    }
+
+    /* Dev Mailbox Drawer */
+    .dev-drawer {
+      position: fixed;
+      bottom: 20px;
+      right: 20px;
+      z-index: 100;
+      width: 380px;
+      max-width: calc(100vw - 40px);
+      background: rgba(15, 23, 42, 0.95);
+      backdrop-filter: blur(20px);
+      -webkit-backdrop-filter: blur(20px);
+      border: 1px solid var(--border-subtle);
+      border-radius: var(--radius-lg);
+      box-shadow: var(--shadow-subtle);
+      overflow: hidden;
+      transition: all 0.3s cubic-bezier(0.16, 1, 0.3, 1);
+    }
+
+    .dev-drawer-header {
+      padding: 12px 18px;
+      background: rgba(99, 102, 241, 0.15);
+      border-bottom: 1px solid var(--border-subtle);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      cursor: pointer;
+      user-select: none;
+    }
+
+    .dev-drawer-title {
+      font-size: 13px;
+      font-weight: 700;
+      color: #a5b4fc;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .dev-drawer-badge {
+      background: var(--accent-primary);
+      color: #fff;
+      font-size: 11px;
+      font-weight: 700;
+      padding: 2px 7px;
+      border-radius: 9999px;
+    }
+
+    .dev-drawer-body {
+      max-height: 280px;
+      overflow-y: auto;
+      padding: 12px;
+    }
+
+    .dev-otp-card {
+      background: rgba(255, 255, 255, 0.03);
+      border: 1px solid var(--border-subtle);
+      border-radius: var(--radius-sm);
+      padding: 10px 14px;
+      margin-bottom: 8px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+
+    .dev-otp-card:last-child {
+      margin-bottom: 0;
+    }
+
+    .dev-otp-code {
+      font-family: 'JetBrains Mono', monospace;
+      font-weight: 700;
+      font-size: 16px;
+      color: #38bdf8;
+    }
+
+    /* Toast System */
+    .toast-container {
+      position: fixed;
+      top: 24px;
+      right: 24px;
+      z-index: 9999;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+
+    .toast {
+      background: var(--bg-surface-elevated);
+      border: 1px solid var(--border-subtle);
+      color: #fff;
+      padding: 14px 20px;
+      border-radius: var(--radius-md);
+      box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5);
+      font-size: 14px;
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      animation: slideIn 0.3s ease;
+      min-width: 300px;
+      max-width: 450px;
+    }
+
+    .toast.success {
+      border-left: 4px solid var(--accent-emerald);
+    }
+
+    .toast.error {
+      border-left: 4px solid var(--accent-rose);
+    }
+
+    .toast.info {
+      border-left: 4px solid var(--accent-primary);
+    }
+
+    @keyframes slideIn {
+      from {
+        transform: translateX(100%);
+        opacity: 0;
+      }
+
+      to {
+        transform: translateX(0);
+        opacity: 1;
+      }
+    }
+
+    /* Responsive Views */
+    .view-section {
+      display: none;
+    }
+
+    .view-section.active {
+      display: block;
+      animation: fadeIn 0.3s ease;
+    }
+
+    @keyframes fadeIn {
+      from {
+        opacity: 0;
+        transform: translateY(8px);
+      }
+
+      to {
+        opacity: 1;
+        transform: translateY(0);
+      }
+    }
+
+    @media (max-width: 768px) {
+      .hero-title {
+        font-size: 32px;
+      }
+
+      .nav-container {
+        flex-direction: column;
+        gap: 14px;
+        align-items: stretch;
+      }
+
+      .nav-tabs {
+        justify-content: center;
+      }
+
+      .wizard-steps {
+        margin-bottom: 24px;
+      }
+
+      .step-label {
+        display: none;
+      }
+
+      .dev-drawer {
+        width: calc(100vw - 32px);
+        bottom: 16px;
+        right: 16px;
+      }
+    }
+  </style>
+</head>
+
+<body>
+  <!-- Toast notification outlet -->
+  <div id="toastContainer" class="toast-container"></div>
+
+  <!-- Header -->
+  <header>
+    <div class="nav-container">
+      <a href="#" class="brand" onclick="switchView('book'); return false;">
+        <div class="brand-icon">🍽️</div>
+        <div>
+          <div class="brand-title">TableKeeper</div>
+        </div>
+      </a>
+
+      <nav class="nav-tabs" role="tablist">
+        <button id="navTabBook" class="nav-tab-btn active" onclick="switchView('book')">
+          <span>📅</span> Book a Table
+        </button>
+        <button id="navTabManage" class="nav-tab-btn" onclick="switchView('manage')">
+          <span>🔍</span> Manage / Cancel
+        </button>
+        <button id="navTabRestaurants" class="nav-tab-btn" onclick="switchView('restaurants')">
+          <span>🏛️</span> Restaurants
+        </button>
+      </nav>
+
+      <div class="server-status">
+        <div class="status-dot"></div>
+        <span id="serverStatusText">PostgreSQL Connected</span>
+      </div>
+    </div>
+  </header>
+
+  <div class="main-container">
+    <!-- Hero Banner -->
+    <section class="hero">
+      <div class="hero-badge">⚡ Stage 4 Verified Guest Architecture</div>
+      <h1 class="hero-title">Conflict-Free Dining, <span>Guaranteed.</span></h1>
+      <p class="hero-desc">
+        Zero double-bookings with PostgreSQL transactional exclusion locks. No accounts required &mdash; instant guest
+        booking backed by 6-digit email verification.
+      </p>
+      <div class="guarantees-bar">
+        <div class="guarantee-item">
+          <svg fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7" />
+          </svg>
+          2-Hour Half-Open Window [start, end)
+        </div>
+        <div class="guarantee-item">
+          <svg fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7" />
+          </svg>
+          Strict Idempotent Replays
+        </div>
+        <div class="guarantee-item">
+          <svg fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7" />
+          </svg>
+          Per-Mailbox Quota Protection
+        </div>
+      </div>
+    </section>
+
+    <!-- VIEW 1: BOOKING WIZARD -->
+    <section id="viewBook" class="view-section active">
+      <div class="card">
+        <!-- Step Progress Indicator -->
+        <div class="wizard-steps">
+          <div id="step1Indicator" class="wizard-step active" onclick="goToStep(1)">
+            <div class="step-circle">1</div>
+            <div class="step-label">Table &amp; Time</div>
+          </div>
+          <div id="step2Indicator" class="wizard-step" onclick="goToStep(2)">
+            <div class="step-circle">2</div>
+            <div class="step-label">Email Verification</div>
+          </div>
+          <div id="step3Indicator" class="wizard-step" onclick="goToStep(3)">
+            <div class="step-circle">3</div>
+            <div class="step-label">Confirm</div>
+          </div>
+          <div id="step4Indicator" class="wizard-step">
+            <div class="step-circle">4</div>
+            <div class="step-label">Receipt</div>
+          </div>
+        </div>
+
+        <!-- STEP 1 CONTENT: Details & Availability -->
+        <div id="step1Content">
+          <div class="card-header">
+            <h2 class="card-title">Select Restaurant &amp; Schedule</h2>
+            <p class="card-subtitle">Choose your party size, date, and time. Real-time availability is checked
+              automatically.</p>
+          </div>
+
+          <div class="form-grid">
+            <div class="form-group" style="grid-column: 1 / -1;">
+              <label class="form-label" for="restaurantSelect">Restaurant</label>
+              <select id="restaurantSelect" class="form-select" onchange="checkAvailability()">
+                <option value="">Loading restaurants...</option>
+              </select>
+            </div>
+
+            <div class="form-group" style="grid-column: 1 / -1;">
+              <label class="form-label">Party Size (Guests)</label>
+              <div class="party-chips" id="partyChipsContainer">
+                <div class="party-chip" data-size="1" onclick="selectPartySize(1)">1 Guest</div>
+                <div class="party-chip selected" data-size="2" onclick="selectPartySize(2)">2 Guests</div>
+                <div class="party-chip" data-size="3" onclick="selectPartySize(3)">3 Guests</div>
+                <div class="party-chip" data-size="4" onclick="selectPartySize(4)">4 Guests</div>
+                <div class="party-chip" data-size="5" onclick="selectPartySize(5)">5 Guests</div>
+                <div class="party-chip" data-size="6" onclick="selectPartySize(6)">6 Guests</div>
+                <div class="party-chip" data-size="8" onclick="selectPartySize(8)">8 Guests</div>
+              </div>
+            </div>
+
+            <div class="form-group">
+              <label class="form-label" for="bookingDate">Date</label>
+              <input type="date" id="bookingDate" class="form-input" onchange="checkAvailability()">
+            </div>
+
+            <div class="form-group">
+              <label class="form-label" for="bookingTime">Time (Local)</label>
+              <select id="bookingTime" class="form-select" onchange="checkAvailability()">
+                <option value="12:00">12:00 PM (Lunch)</option>
+                <option value="12:30">12:30 PM (Lunch)</option>
+                <option value="13:00">01:00 PM (Lunch)</option>
+                <option value="13:30">01:30 PM (Lunch)</option>
+                <option value="18:00">06:00 PM (Dinner)</option>
+                <option value="18:30">06:30 PM (Dinner)</option>
+                <option value="19:00" selected>07:00 PM (Dinner)</option>
+                <option value="19:30">07:30 PM (Dinner)</option>
+                <option value="20:00">08:00 PM (Dinner)</option>
+                <option value="20:30">08:30 PM (Dinner)</option>
+                <option value="21:00">09:00 PM (Dinner)</option>
+              </select>
+            </div>
+          </div>
+
+          <!-- Live Availability Status Banner -->
+          <div id="availabilityBanner" class="availability-banner checking">
+            <span>⏳</span>
+            <div id="availabilityText">Checking table availability in restaurant timezone...</div>
+          </div>
+
+          <div style="display: flex; justify-content: flex-end;">
+            <button id="step1NextBtn" class="btn" onclick="proceedToVerification()" disabled>
+              Continue to Guest Verification &rarr;
+            </button>
+          </div>
+        </div>
+
+        <!-- STEP 2 CONTENT: Email Verification -->
+        <div id="step2Content" style="display: none;">
+          <div class="card-header">
+            <h2 class="card-title">Guest Email Verification</h2>
+            <p class="card-subtitle">No passwords or accounts needed. We send a one-time 6-digit passcode to verify your
+              email.</p>
+          </div>
+
+          <div style="max-width: 480px; margin: 0 auto;">
+            <div class="form-group" style="margin-bottom: 20px;">
+              <label class="form-label" for="customerEmail">Your Email Address</label>
+              <div style="display: flex; gap: 8px;">
+                <input type="email" id="customerEmail" class="form-input" placeholder="guest@example.com"
+                  value="guest@example.com">
+                <button id="sendOtpBtn" class="btn btn-secondary" onclick="sendVerificationOtp()">
+                  Send Code
+                </button>
+              </div>
+            </div>
+
+            <!-- OTP Input Section -->
+            <div id="otpInputSection" style="display: none; animation: fadeIn 0.3s ease;">
+              <div style="text-align: center; margin-bottom: 8px;">
+                <span style="font-size: 13px; color: var(--text-secondary);">Enter the 6-digit passcode:</span>
+              </div>
+
+              <div class="otp-container">
+                <input type="text" maxlength="1" class="otp-input" id="otp1" oninput="handleOtpInput(1, event)"
+                  onkeydown="handleOtpKey(1, event)">
+                <input type="text" maxlength="1" class="otp-input" id="otp2" oninput="handleOtpInput(2, event)"
+                  onkeydown="handleOtpKey(2, event)">
+                <input type="text" maxlength="1" class="otp-input" id="otp3" oninput="handleOtpInput(3, event)"
+                  onkeydown="handleOtpKey(3, event)">
+                <input type="text" maxlength="1" class="otp-input" id="otp4" oninput="handleOtpInput(4, event)"
+                  onkeydown="handleOtpKey(4, event)">
+                <input type="text" maxlength="1" class="otp-input" id="otp5" oninput="handleOtpInput(5, event)"
+                  onkeydown="handleOtpKey(5, event)">
+                <input type="text" maxlength="1" class="otp-input" id="otp6" oninput="handleOtpInput(6, event)"
+                  onkeydown="handleOtpKey(6, event)">
+              </div>
+
+              <div id="otpLiveHelper"
+                style="text-align: center; margin-bottom: 16px; font-size: 13px; color: var(--accent-cyan); display: none;">
+                💡 <strong>Dev Quick Fill:</strong> Code <code id="quickOtpCode"
+                  style="font-size: 14px; font-weight: bold;">------</code>
+                <button class="btn btn-secondary" style="padding: 4px 10px; font-size: 12px; margin-left: 8px;"
+                  onclick="autofillQuickOtp()">Fill</button>
+              </div>
+
+              <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 24px;">
+                <span id="resendCountdown" style="font-size: 13px; color: var(--text-muted);">Resend in 60s</span>
+                <button id="resendBtn" class="btn btn-secondary" style="padding: 6px 12px; font-size: 13px;"
+                  onclick="sendVerificationOtp()" disabled>
+                  Resend Code
+                </button>
+              </div>
+
+              <button id="verifyOtpBtn" class="btn btn-success" style="width: 100%;" onclick="confirmVerificationOtp()">
+                Verify &amp; Continue &rarr;
+              </button>
+            </div>
+          </div>
+
+          <div style="display: flex; justify-content: flex-start; margin-top: 24px;">
+            <button class="btn btn-secondary" onclick="goToStep(1)">&larr; Back to Details</button>
+          </div>
+        </div>
+
+        <!-- STEP 3 CONTENT: Review & Confirm -->
+        <div id="step3Content" style="display: none;">
+          <div class="card-header">
+            <h2 class="card-title">Review &amp; Confirm Booking</h2>
+            <p class="card-subtitle">Double-check your reservation details before locking the table in PostgreSQL.</p>
+          </div>
+
+          <div
+            style="max-width: 540px; margin: 0 auto; background: var(--bg-surface-elevated); border: 1px solid var(--border-subtle); border-radius: var(--radius-lg); padding: 24px; margin-bottom: 24px;">
+            <div
+              style="display: flex; justify-content: space-between; padding-bottom: 12px; border-bottom: 1px solid var(--border-subtle); margin-bottom: 12px;">
+              <span style="color: var(--text-muted); font-size: 14px;">Restaurant</span>
+              <span id="summaryRestaurant" style="font-weight: 700; color: #fff;">-</span>
+            </div>
+            <div
+              style="display: flex; justify-content: space-between; padding-bottom: 12px; border-bottom: 1px solid var(--border-subtle); margin-bottom: 12px;">
+              <span style="color: var(--text-muted); font-size: 14px;">Party Size</span>
+              <span id="summaryPartySize" style="font-weight: 700; color: #fff;">-</span>
+            </div>
+            <div
+              style="display: flex; justify-content: space-between; padding-bottom: 12px; border-bottom: 1px solid var(--border-subtle); margin-bottom: 12px;">
+              <span style="color: var(--text-muted); font-size: 14px;">Date &amp; Time (Local)</span>
+              <span id="summaryDateTime" style="font-weight: 700; color: #38bdf8;">-</span>
+            </div>
+            <div
+              style="display: flex; justify-content: space-between; padding-bottom: 12px; border-bottom: 1px solid var(--border-subtle); margin-bottom: 12px;">
+              <span style="color: var(--text-muted); font-size: 14px;">Duration</span>
+              <span style="font-weight: 700; color: #fff;">2 Elapsed Hours</span>
+            </div>
+            <div style="display: flex; justify-content: space-between;">
+              <span style="color: var(--text-muted); font-size: 14px;">Verified Email</span>
+              <span id="summaryEmail" style="font-weight: 700; color: #34d399;">-</span>
+            </div>
+          </div>
+
+          <div style="display: flex; justify-content: space-between;">
+            <button class="btn btn-secondary" onclick="goToStep(2)">&larr; Back to Email</button>
+            <button id="bookNowBtn" class="btn btn-success" onclick="createReservation()">
+              🔒 Lock Table &amp; Reserve
+            </button>
+          </div>
+        </div>
+
+        <!-- STEP 4 CONTENT: Receipt Card -->
+        <div id="step4Content" style="display: none;">
+          <div class="receipt-card">
+            <div class="receipt-badge">🎉</div>
+            <h2 style="font-family: 'Outfit', sans-serif; font-size: 28px; font-weight: 800; margin-bottom: 8px;">
+              Reservation Confirmed!</h2>
+            <p style="color: var(--text-secondary); font-size: 15px;">Your table has been reserved with transactional
+              exclusion guarantees.</p>
+
+            <div style="margin: 24px 0;">
+              <div style="font-size: 13px; color: var(--accent-amber); font-weight: 600; margin-bottom: 6px;">
+                🔑 YOUR CONFIRMATION CODE (KEEP THIS SAFE)
+              </div>
+              <div class="code-display-box">
+                <span id="receiptCode" class="code-text">------</span>
+                <button class="btn btn-secondary" style="padding: 6px 14px; font-size: 13px;"
+                  onclick="copyConfirmationCode()">
+                  📋 Copy
+                </button>
+              </div>
+              <p style="font-size: 12px; color: var(--text-muted);">
+                This 12-character code is required if you ever need to view or cancel this reservation.
+              </p>
+            </div>
+
+            <div class="receipt-details">
+              <div class="receipt-detail-item">
+                <span class="receipt-detail-label">Reservation ID</span>
+                <span id="receiptId" class="receipt-detail-value"
+                  style="font-family: 'JetBrains Mono', monospace; font-size: 12px;">-</span>
+              </div>
+              <div class="receipt-detail-item">
+                <span class="receipt-detail-label">Party Size &amp; Table</span>
+                <span id="receiptPartyTable" class="receipt-detail-value">-</span>
+              </div>
+              <div class="receipt-detail-item">
+                <span class="receipt-detail-label">Start Time</span>
+                <span id="receiptStartsAt" class="receipt-detail-value">-</span>
+              </div>
+              <div class="receipt-detail-item">
+                <span class="receipt-detail-label">End Time</span>
+                <span id="receiptEndsAt" class="receipt-detail-value">-</span>
+              </div>
+            </div>
+
+            <div style="display: flex; gap: 12px; justify-content: center; flex-wrap: wrap;">
+              <button class="btn" onclick="goToStep(1); resetBookingWizard();">Book Another Table</button>
+              <button class="btn btn-secondary" onclick="manageCreatedReservation()">Manage This Reservation</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- VIEW 2: MANAGE / CANCEL RESERVATION -->
+    <section id="viewManage" class="view-section">
+      <div class="card">
+        <div class="card-header">
+          <h2 class="card-title">🔍 Manage or Cancel Reservation</h2>
+          <p class="card-subtitle">Retrieve reservation details using your Reservation UUID and 12-character
+            Confirmation Code.</p>
+        </div>
+
+        <div style="max-width: 580px; margin: 0 auto;">
+          <div class="form-group" style="margin-bottom: 16px;">
+            <label class="form-label" for="lookupId">Reservation UUID</label>
+            <input type="text" id="lookupId" class="form-input" placeholder="e.g. 550e8400-e29b-41d4-a716-446655440000">
+          </div>
+
+          <div class="form-group" style="margin-bottom: 24px;">
+            <label class="form-label" for="lookupCode">12-Character Confirmation Code</label>
+            <input type="text" id="lookupCode" class="form-input" placeholder="e.g. A1B2C3D4E5F6" maxlength="12"
+              style="font-family: 'JetBrains Mono', monospace; letter-spacing: 2px;">
+          </div>
+
+          <button id="lookupBtn" class="btn" style="width: 100%; margin-bottom: 24px;" onclick="lookupReservation()">
+            Look Up Reservation
+          </button>
+
+          <!-- Lookup Results Card -->
+          <div id="lookupResultCard"
+            style="display: none; background: var(--bg-surface-elevated); border: 1px solid var(--border-subtle); border-radius: var(--radius-lg); padding: 24px; animation: fadeIn 0.3s ease;">
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px;">
+              <h3 style="font-size: 18px; font-weight: 700;">Reservation Details</h3>
+              <span id="lookupStatusBadge"
+                style="padding: 4px 10px; border-radius: 9999px; font-size: 12px; font-weight: 700;">-</span>
+            </div>
+
+            <div style="display: grid; grid-template-columns: repeat(2, 1fr); gap: 12px; margin-bottom: 20px;">
+              <div>
+                <div style="font-size: 12px; color: var(--text-muted);">PARTY SIZE</div>
+                <div id="lookupPartySize" style="font-weight: 600;">-</div>
+              </div>
+              <div>
+                <div style="font-size: 12px; color: var(--text-muted);">TABLE CAPACITY</div>
+                <div id="lookupCapacity" style="font-weight: 600;">-</div>
+              </div>
+              <div>
+                <div style="font-size: 12px; color: var(--text-muted);">STARTS AT</div>
+                <div id="lookupStartsAt" style="font-weight: 600; color: #38bdf8;">-</div>
+              </div>
+              <div>
+                <div style="font-size: 12px; color: var(--text-muted);">ENDS AT</div>
+                <div id="lookupEndsAt" style="font-weight: 600; color: #38bdf8;">-</div>
+              </div>
+            </div>
+
+            <div id="cancelActionContainer">
+              <button id="cancelBtn" class="btn btn-danger" style="width: 100%;" onclick="cancelReservation()">
+                Cancel This Reservation
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- VIEW 3: RESTAURANT DIRECTORY -->
+    <section id="viewRestaurants" class="view-section">
+      <div class="card">
+        <div class="card-header"
+          style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 16px;">
+          <div>
+            <h2 class="card-title">🏛️ Restaurant Directory</h2>
+            <p class="card-subtitle">Active venues with managed dining tables and timezone boundaries.</p>
+          </div>
+          <div style="display: flex; gap: 8px;">
+            <input type="text" id="restaurantSearchInput" class="form-input" placeholder="Search by name..."
+              style="width: 240px;" oninput="filterRestaurants(this.value)">
+          </div>
+        </div>
+
+        <div id="restaurantsListContainer"
+          style="display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 20px;">
+          <!-- Loaded dynamically -->
+        </div>
+      </div>
+    </section>
+  </div>
+
+  <!-- Dev Mailbox Drawer -->
+  <div id="devDrawer" class="dev-drawer">
+    <div class="dev-drawer-header" onclick="toggleDevDrawer()">
+      <div class="dev-drawer-title">
+        <span>📬 Dev Mailbox / OTPs</span>
+        <span id="devOtpCount" class="dev-drawer-badge">0</span>
+      </div>
+      <span id="devDrawerToggleIcon" style="font-size: 12px; color: var(--text-muted);">▼</span>
+    </div>
+    <div id="devDrawerBody" class="dev-drawer-body">
+      <div id="devDrawerEmpty" style="text-align: center; color: var(--text-muted); font-size: 13px; padding: 20px 0;">
+        No verification codes sent yet.
+      </div>
+      <div id="devDrawerList"></div>
+    </div>
+  </div>
+
+  <!-- Main JavaScript App Logic -->
+  <script>
+    // State management
+    const state = {
+      restaurants: [],
+      selectedRestaurantId: '',
+      partySize: 2,
+      date: '',
+      time: '19:00',
+      isAvailable: false,
+      verificationId: '',
+      verificationToken: '',
+      tokenExpiresAt: '',
+      lastReservation: null,
+      cooldownTimer: null,
+      cooldownSeconds: 0,
+      devDrawerOpen: false,
+      devOtps: []
+    };
+
+    // Initialize defaults on load
+    window.addEventListener('DOMContentLoaded', async () => {
+      initDate();
+      await fetchRestaurants();
+      startOtpPolling();
+    });
+
+    function initDate() {
+      const tomorrow = new Date();
+      tomorrow.setDate(tomorrow.getDate() + 1);
+      const yyyy = tomorrow.getFullYear();
+      const mm = String(tomorrow.getMonth() + 1).padStart(2, '0');
+      const dd = String(tomorrow.getDate()).padStart(2, '0');
+      state.date = `${yyyy}-${mm}-${dd}`;
+      document.getElementById('bookingDate').value = state.date;
+    }
+
+    // View Switching
+    function switchView(viewName) {
+      document.querySelectorAll('.view-section').forEach(el => el.classList.remove('active'));
+      document.querySelectorAll('.nav-tab-btn').forEach(el => el.classList.remove('active'));
+
+      if (viewName === 'book') {
+        document.getElementById('viewBook').classList.add('active');
+        document.getElementById('navTabBook').classList.add('active');
+      } else if (viewName === 'manage') {
+        document.getElementById('viewManage').classList.add('active');
+        document.getElementById('navTabManage').classList.add('active');
+      } else if (viewName === 'restaurants') {
+        document.getElementById('viewRestaurants').classList.add('active');
+        document.getElementById('navTabRestaurants').classList.add('active');
+        renderRestaurantsList();
+      }
+    }
+
+    // Wizard Step Navigation
+    function goToStep(stepNumber) {
+      if (stepNumber === 2 && !state.isAvailable) {
+        showToast('Please choose an available date/time first.', 'error');
+        return;
+      }
+      if (stepNumber === 3 && !state.verificationToken) {
+        showToast('Please verify your email first.', 'error');
+        return;
+      }
+
+      document.getElementById('step1Content').style.display = stepNumber === 1 ? 'block' : 'none';
+      document.getElementById('step2Content').style.display = stepNumber === 2 ? 'block' : 'none';
+      document.getElementById('step3Content').style.display = stepNumber === 3 ? 'block' : 'none';
+      document.getElementById('step4Content').style.display = stepNumber === 4 ? 'block' : 'none';
+
+      for (let i = 1; i <= 4; i++) {
+        const ind = document.getElementById(`step${i}Indicator`);
+        ind.classList.remove('active', 'completed');
+        if (i < stepNumber) ind.classList.add('completed');
+        if (i === stepNumber) ind.classList.add('active');
+      }
+
+      if (stepNumber === 3) {
+        updateStep3Summary();
+      }
+    }
+
+    // Party Size Selection
+    function selectPartySize(size) {
+      state.partySize = size;
+      document.querySelectorAll('.party-chip').forEach(chip => {
+        chip.classList.toggle('selected', Number(chip.dataset.size) === size);
+      });
+      checkAvailability();
+    }
+
+    // Fetch Restaurants
+    async function fetchRestaurants(searchQuery = '') {
+      try {
+        const res = await fetch(`/restaurants?query=${encodeURIComponent(searchQuery)}`);
+        if (!res.ok) throw new Error('Failed to load restaurants');
+        state.restaurants = await res.json();
+
+        const select = document.getElementById('restaurantSelect');
+        select.innerHTML = state.restaurants.map(r =>
+          `<option value="${r.id}">${r.name} (${r.timezone})</option>`
+        ).join('');
+
+        if (state.restaurants.length > 0) {
+          state.selectedRestaurantId = state.restaurants[0].id;
+          checkAvailability();
+        }
+      } catch (err) {
+        console.error(err);
+        showToast('Could not load restaurants from backend API.', 'error');
+      }
+    }
+
+    // Check Live Availability
+    let availabilityTimeout = null;
+    async function checkAvailability() {
+      const select = document.getElementById('restaurantSelect');
+      state.selectedRestaurantId = select.value;
+      state.date = document.getElementById('bookingDate').value;
+      state.time = document.getElementById('bookingTime').value;
+
+      if (!state.selectedRestaurantId || !state.date || !state.time) return;
+
+      const banner = document.getElementById('availabilityBanner');
+      const text = document.getElementById('availabilityText');
+      const nextBtn = document.getElementById('step1NextBtn');
+
+      banner.className = 'availability-banner checking';
+      text.innerText = 'Checking real-time PostgreSQL table availability...';
+      nextBtn.disabled = true;
+
+      clearTimeout(availabilityTimeout);
+      availabilityTimeout = setTimeout(async () => {
+        try {
+          const url = `/restaurants/${state.selectedRestaurantId}/availability?date=${state.date}&time=${state.time}&party_size=${state.partySize}`;
+          const res = await fetch(url);
+          const data = await res.json();
+
+          if (res.ok && data.available) {
+            state.isAvailable = true;
+            banner.className = 'availability-banner available';
+            text.innerHTML = `<strong>✅ Table Available!</strong> Dining window: 2 hours in timezone <code>${data.timezone}</code>.`;
+            nextBtn.disabled = false;
+          } else {
+            state.isAvailable = false;
+            banner.className = 'availability-banner unavailable';
+            text.innerHTML = `<strong>❌ No Table Available</strong> for party of ${state.partySize} at ${state.time}. Please try an adjacent time slot.`;
+            nextBtn.disabled = true;
+          }
+        } catch (err) {
+          banner.className = 'availability-banner unavailable';
+          text.innerText = 'Error checking table availability.';
+          nextBtn.disabled = true;
+        }
+      }, 250);
+    }
+
+    function proceedToVerification() {
+      if (!state.isAvailable) return;
+      goToStep(2);
+    }
+
+    // Send Verification OTP
+    async function sendVerificationOtp() {
+      const emailInput = document.getElementById('customerEmail');
+      const email = emailInput.value.trim();
+      if (!email || !email.includes('@')) {
+        showToast('Please enter a valid email address.', 'error');
+        return;
+      }
+
+      const sendBtn = document.getElementById('sendOtpBtn');
+      sendBtn.disabled = true;
+      sendBtn.innerText = 'Sending...';
+
+      try {
+        const res = await fetch('/booking-verifications', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ email })
+        });
+
+        const data = await res.json();
+        if (res.status === 202) {
+          state.verificationId = data.verification_id;
+          showToast('Verification code sent to your email!', 'success');
+          document.getElementById('otpInputSection').style.display = 'block';
+          document.getElementById('otp1').focus();
+          startCooldown(60);
+          pollDevOtpsOnce();
+        } else if (res.status === 429) {
+          showToast('Verification rate limit reached. Please wait a few minutes.', 'error');
+        } else {
+          showToast(data.message || 'Could not send verification email.', 'error');
+        }
+      } catch (err) {
+        showToast('Network error while requesting verification.', 'error');
+      } finally {
+        sendBtn.disabled = false;
+        sendBtn.innerText = 'Send Code';
+      }
+    }
+
+    // Cooldown Timer
+    function startCooldown(seconds) {
+      state.cooldownSeconds = seconds;
+      const resendBtn = document.getElementById('resendBtn');
+      const countdown = document.getElementById('resendCountdown');
+      resendBtn.disabled = true;
+
+      clearInterval(state.cooldownTimer);
+      state.cooldownTimer = setInterval(() => {
+        state.cooldownSeconds--;
+        if (state.cooldownSeconds <= 0) {
+          clearInterval(state.cooldownTimer);
+          countdown.innerText = 'You can resend now';
+          resendBtn.disabled = false;
+        } else {
+          countdown.innerText = `Resend in ${state.cooldownSeconds}s`;
+        }
+      }, 1000);
+    }
+
+    // OTP Input Navigation
+    function handleOtpInput(index, event) {
+      const val = event.target.value;
+      if (val && index < 6) {
+        document.getElementById(`otp${index + 1}`).focus();
+      }
+      checkOtpComplete();
+    }
+
+    function handleOtpKey(index, event) {
+      if (event.key === 'Backspace' && !event.target.value && index > 1) {
+        document.getElementById(`otp${index - 1}`).focus();
+      }
+    }
+
+    function getEnteredOtp() {
+      let code = '';
+      for (let i = 1; i <= 6; i++) {
+        code += document.getElementById(`otp${i}`).value.trim();
+      }
+      return code;
+    }
+
+    function checkOtpComplete() {
+      const code = getEnteredOtp();
+      if (code.length === 6) {
+        confirmVerificationOtp();
+      }
+    }
+
+    function autofillQuickOtp() {
+      const code = document.getElementById('quickOtpCode').innerText;
+      if (code && code.length === 6) {
+        for (let i = 1; i <= 6; i++) {
+          document.getElementById(`otp${i}`).value = code[i - 1];
+        }
+        confirmVerificationOtp();
+      }
+    }
+
+    // Confirm Verification OTP
+    async function confirmVerificationOtp() {
+      const code = getEnteredOtp();
+      if (code.length !== 6) {
+        showToast('Please enter the full 6-digit code.', 'error');
+        return;
+      }
+
+      const verifyBtn = document.getElementById('verifyOtpBtn');
+      verifyBtn.disabled = true;
+      verifyBtn.innerText = 'Verifying...';
+
+      try {
+        const res = await fetch(`/booking-verifications/${state.verificationId}/confirm`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ code })
+        });
+
+        const data = await res.json();
+        if (res.ok) {
+          state.verificationToken = data.verification_token;
+          state.tokenExpiresAt = data.expires_at;
+          showToast('Email verified successfully! Token valid for 15 minutes.', 'success');
+          goToStep(3);
+        } else {
+          showToast(data.message || 'Verification failed. Please check the code.', 'error');
+        }
+      } catch (err) {
+        showToast('Error confirming verification code.', 'error');
+      } finally {
+        verifyBtn.disabled = false;
+        verifyBtn.innerText = 'Verify & Continue →';
+      }
+    }
+
+    // Summary for Step 3
+    function updateStep3Summary() {
+      const r = state.restaurants.find(x => x.id === state.selectedRestaurantId);
+      document.getElementById('summaryRestaurant').innerText = r ? `${r.name} (${r.timezone})` : '-';
+      document.getElementById('summaryPartySize').innerText = `${state.partySize} Guests`;
+      document.getElementById('summaryDateTime').innerText = `${state.date} at ${state.time} (${r ? r.timezone : ''})`;
+      document.getElementById('summaryEmail').innerText = document.getElementById('customerEmail').value;
+    }
+
+    // Create Reservation
+    async function createReservation() {
+      const bookBtn = document.getElementById('bookNowBtn');
+      bookBtn.disabled = true;
+      bookBtn.innerText = 'Committing Reservation...';
+
+      const idempotencyKey = crypto.randomUUID();
+      const payload = {
+        party_size: state.partySize,
+        starts_at_local: `${state.date}T${state.time}`
+      };
+
+      try {
+        const res = await fetch(`/restaurants/${state.selectedRestaurantId}/reservations`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Idempotency-Key': idempotencyKey,
+            'Customer-Verification-Token': state.verificationToken
+          },
+          body: JSON.stringify(payload)
+        });
+
+        const data = await res.json();
+        if (res.status === 201 || res.status === 200) {
+          state.lastReservation = data;
+          showReceipt(data);
+          goToStep(4);
+          showToast('Table successfully booked and confirmed!', 'success');
+        } else if (res.status === 429) {
+          showToast('Booking rate limit reached for this email. Try again later.', 'error');
+        } else if (res.status === 409) {
+          showToast(data.message || 'No suitable table available or timing conflict.', 'error');
+        } else {
+          showToast(data.message || 'Reservation could not be completed.', 'error');
+        }
+      } catch (err) {
+        showToast('Network error committing reservation.', 'error');
+      } finally {
+        bookBtn.disabled = false;
+        bookBtn.innerText = '🔒 Lock Table & Reserve';
+      }
+    }
+
+    // Show Receipt
+    function showReceipt(reservation) {
+      document.getElementById('receiptCode').innerText = reservation.confirmation_code;
+      document.getElementById('receiptId').innerText = reservation.id;
+      document.getElementById('receiptPartyTable').innerText = `${reservation.party_size} guests (Table capacity: ${reservation.table_capacity})`;
+      document.getElementById('receiptStartsAt').innerText = `${reservation.starts_at} (${reservation.timezone})`;
+      document.getElementById('receiptEndsAt').innerText = `${reservation.ends_at} (${reservation.timezone})`;
+    }
+
+    function copyConfirmationCode() {
+      const code = document.getElementById('receiptCode').innerText;
+      navigator.clipboard.writeText(code);
+      showToast('Confirmation code copied to clipboard!', 'success');
+    }
+
+    function resetBookingWizard() {
+      state.verificationToken = '';
+      state.verificationId = '';
+      for (let i = 1; i <= 6; i++) {
+        document.getElementById(`otp${i}`).value = '';
+      }
+      document.getElementById('otpInputSection').style.display = 'none';
+      checkAvailability();
+    }
+
+    function manageCreatedReservation() {
+      if (!state.lastReservation) return;
+      document.getElementById('lookupId').value = state.lastReservation.id;
+      document.getElementById('lookupCode').value = state.lastReservation.confirmation_code;
+      switchView('manage');
+      lookupReservation();
+    }
+
+    // Lookup Reservation
+    async function lookupReservation() {
+      const id = document.getElementById('lookupId').value.trim();
+      const code = document.getElementById('lookupCode').value.trim();
+
+      if (!id || !code) {
+        showToast('Please enter both Reservation UUID and 12-character code.', 'error');
+        return;
+      }
+
+      const lookupBtn = document.getElementById('lookupBtn');
+      lookupBtn.disabled = true;
+      lookupBtn.innerText = 'Looking up...';
+
+      try {
+        const res = await fetch(`/reservations/${id}`, {
+          headers: { 'Reservation-Confirmation-Code': code }
+        });
+
+        const data = await res.json();
+        if (res.ok) {
+          renderLookupResult(data);
+        } else if (res.status === 404) {
+          showToast('Reservation not found or invalid confirmation code.', 'error');
+          document.getElementById('lookupResultCard').style.display = 'none';
+        } else if (res.status === 429) {
+          showToast('Too many failed code attempts. Please wait 15 minutes.', 'error');
+          document.getElementById('lookupResultCard').style.display = 'none';
+        } else {
+          showToast(data.message || 'Error looking up reservation.', 'error');
+        }
+      } catch (err) {
+        showToast('Network error while looking up reservation.', 'error');
+      } finally {
+        lookupBtn.disabled = false;
+        lookupBtn.innerText = 'Look Up Reservation';
+      }
+    }
+
+    function renderLookupResult(res) {
+      const card = document.getElementById('lookupResultCard');
+      const badge = document.getElementById('lookupStatusBadge');
+
+      card.style.display = 'block';
+      if (res.status === 'confirmed') {
+        badge.innerText = 'CONFIRMED';
+        badge.style.background = 'rgba(16, 185, 129, 0.2)';
+        badge.style.color = '#34d399';
+        badge.style.border = '1px solid rgba(16, 185, 129, 0.4)';
+        document.getElementById('cancelActionContainer').style.display = 'block';
+      } else {
+        badge.innerText = 'CANCELLED';
+        badge.style.background = 'rgba(244, 63, 94, 0.2)';
+        badge.style.color = '#fb7185';
+        badge.style.border = '1px solid rgba(244, 63, 94, 0.4)';
+        document.getElementById('cancelActionContainer').style.display = 'none';
+      }
+
+      document.getElementById('lookupPartySize').innerText = `${res.party_size} guests`;
+      document.getElementById('lookupCapacity').innerText = `Table for ${res.table_capacity}`;
+      document.getElementById('lookupStartsAt').innerText = `${res.starts_at} (${res.timezone})`;
+      document.getElementById('lookupEndsAt').innerText = `${res.ends_at} (${res.timezone})`;
+    }
+
+    // Cancel Reservation
+    async function cancelReservation() {
+      const id = document.getElementById('lookupId').value.trim();
+      const code = document.getElementById('lookupCode').value.trim();
+
+      if (!confirm('Are you sure you want to cancel this reservation? The table will be immediately released.')) {
+        return;
+      }
+
+      const cancelBtn = document.getElementById('cancelBtn');
+      cancelBtn.disabled = true;
+      cancelBtn.innerText = 'Cancelling...';
+
+      try {
+        const res = await fetch(`/reservations/${id}`, {
+          method: 'DELETE',
+          headers: { 'Reservation-Confirmation-Code': code }
+        });
+
+        const data = await res.json();
+        if (res.ok) {
+          showToast('Reservation cancelled and table released.', 'success');
+          renderLookupResult(data);
+        } else {
+          showToast(data.message || 'Failed to cancel reservation.', 'error');
+        }
+      } catch (err) {
+        showToast('Network error while cancelling.', 'error');
+      } finally {
+        cancelBtn.disabled = false;
+        cancelBtn.innerText = 'Cancel This Reservation';
+      }
+    }
+
+    // Render Restaurants List
+    function renderRestaurantsList() {
+      const container = document.getElementById('restaurantsListContainer');
+      if (state.restaurants.length === 0) {
+        container.innerHTML = '<div style="color: var(--text-muted);">No restaurants found.</div>';
+        return;
+      }
+
+      container.innerHTML = state.restaurants.map(r => `
+        <div class="card card-glass" style="padding: 24px;">
+          <div style="display: flex; justify-content: space-between; align-items: start; margin-bottom: 12px;">
+            <h3 style="font-size: 20px; font-weight: 700;">${r.name}</h3>
+            <span style="background: rgba(16, 185, 129, 0.15); color: #34d399; font-size: 11px; font-weight: 700; padding: 3px 8px; border-radius: 9999px;">ACTIVE</span>
+          </div>
+          <div style="font-size: 13px; color: var(--text-secondary); margin-bottom: 20px;">
+            <div><strong>Timezone:</strong> <code>${r.timezone}</code></div>
+            <div><strong>ID:</strong> <code style="font-size: 11px;">${r.id}</code></div>
+          </div>
+          <button class="btn btn-secondary" style="width: 100%;" onclick="bookThisRestaurant('${r.id}')">
+            Reserve a Table &rarr;
+          </button>
+        </div>
+      `).join('');
+    }
+
+    function filterRestaurants(query) {
+      fetchRestaurants(query);
+    }
+
+    function bookThisRestaurant(id) {
+      state.selectedRestaurantId = id;
+      document.getElementById('restaurantSelect').value = id;
+      switchView('book');
+      goToStep(1);
+      checkAvailability();
+    }
+
+    // Dev Mailbox Drawer
+    function toggleDevDrawer() {
+      state.devDrawerOpen = !state.devDrawerOpen;
+      const body = document.getElementById('devDrawerBody');
+      const icon = document.getElementById('devDrawerToggleIcon');
+      body.style.display = state.devDrawerOpen ? 'block' : 'none';
+      icon.innerText = state.devDrawerOpen ? '▲' : '▼';
+    }
+
+    async function pollDevOtpsOnce() {
+      try {
+        const res = await fetch('/api/dev-otps');
+        if (res.ok) {
+          const list = await res.json();
+          renderDevOtps(list);
+        }
+      } catch (_) { }
+    }
+
+    function startOtpPolling() {
+      setInterval(pollDevOtpsOnce, 3000);
+    }
+
+    function renderDevOtps(otps) {
+      if (!Array.isArray(otps)) return;
+      state.devOtps = otps;
+      const countBadge = document.getElementById('devOtpCount');
+      const empty = document.getElementById('devDrawerEmpty');
+      const list = document.getElementById('devDrawerList');
+
+      countBadge.innerText = otps.length;
+      if (otps.length === 0) {
+        empty.style.display = 'block';
+        list.innerHTML = '';
+        return;
+      }
+
+      empty.style.display = 'none';
+      list.innerHTML = otps.slice(-5).reverse().map(item => `
+        <div class="dev-otp-card">
+          <div>
+            <div style="font-size: 11px; color: var(--text-muted);">${new Date(item.timestamp).toLocaleTimeString()} &bull; ${item.email}</div>
+            <div class="dev-otp-code">${item.code}</div>
+          </div>
+          <button class="btn btn-secondary" style="padding: 4px 10px; font-size: 12px;" onclick="useDevOtp('${item.code}')">
+            Autofill
+          </button>
+        </div>
+      `).join('');
+
+      // If waiting for OTP in Step 2, update helper
+      if (otps.length > 0) {
+        const latest = otps[otps.length - 1];
+        const helper = document.getElementById('otpLiveHelper');
+        const codeSpan = document.getElementById('quickOtpCode');
+        helper.style.display = 'block';
+        codeSpan.innerText = latest.code;
+      }
+    }
+
+    function useDevOtp(code) {
+      if (code && code.length === 6) {
+        for (let i = 1; i <= 6; i++) {
+          document.getElementById(`otp${i}`).value = code[i - 1];
+        }
+        confirmVerificationOtp();
+      }
+    }
+
+    // Toast Notifications
+    function showToast(message, type = 'info') {
+      const container = document.getElementById('toastContainer');
+      const toast = document.createElement('div');
+      toast.className = `toast ${type}`;
+
+      const icon = type === 'success' ? '✅' : type === 'error' ? '❌' : 'ℹ️';
+      toast.innerHTML = `<span>${icon}</span><div>${message}</div>`;
+
+      container.appendChild(toast);
+      setTimeout(() => {
+        toast.style.opacity = '0';
+        toast.style.transform = 'translateX(100%)';
+        toast.style.transition = 'all 0.3s ease';
+        setTimeout(() => toast.remove(), 300);
+      }, 4000);
+    }
+  </script>
+</body>
+
+</html>

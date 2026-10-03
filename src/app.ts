@@ -22,6 +22,7 @@ import {
   VerificationRateLimitExceeded,
   type VerificationDependencies,
 } from './customer-verification.js';
+import { getUiHtml, recentDevOtps } from './ui.js';
 
 class ApiError extends Error {
   constructor(public readonly statusCode: number, public readonly code: string, message: string) { super(message); }
@@ -283,6 +284,16 @@ export function buildApp(
     reply.code(mapped.statusCode).send(mapped.body);
   });
 
+  app.get('/', async (_request, reply) => {
+    const html = await getUiHtml();
+    return reply.type('text/html; charset=utf-8').send(html);
+  });
+
+
+  app.get('/api/dev-otps', async (_request, reply) => {
+    return reply.send(recentDevOtps);
+  });
+
   app.get('/restaurants', async (request, reply) => {
     const query = (request.query as { query?: string }).query?.trim() ?? '';
     const rows = await db.query(
@@ -496,3 +507,6 @@ export async function insertTable(db: Pool, restaurantId: string, label: string,
   );
   return rows.rows[0].id;
 }
+
+
+
