@@ -1,0 +1,30 @@
+services:
+  - type: web
+    name: tablekeeper
+    env: node
+    plan: free
+    buildCommand: npm install && npm run build
+    startCommand: npm start
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: tablekeeper-db
+          property: connectionString
+      - key: NODE_ENV
+        value: production
+      - key: HOST
+        value: 0.0.0.0
+      - key: BOOKING_RATE_LIMIT_HMAC_SECRET
+        generateValue: true
+      - key: CUSTOMER_VERIFICATION_TOKEN_SECRET
+        generateValue: true
+      - key: EMAIL_FROM
+        value: bookings@tablekeeper.local
+      - key: MOCK_SMTP
+        value: "true"
+
+databases:
+  - name: tablekeeper-db
+    plan: free
+    databaseName: tablekeeper
+    user: tablekeeper

@@ -4,14 +4,17 @@
   "private": true,
   "type": "module",
   "scripts": {
+    "build": "tsc && node scripts/copy-assets.mjs",
     "dev": "tsx scripts/dev-server.mjs",
     "dev:watch": "tsx watch scripts/dev-server.mjs",
-    "dev:server": "tsx watch --env-file=.env src/server.ts",
+    "dev:server": "tsx watch src/server.ts",
     "dev:standalone": "tsx scripts/dev-server.mjs",
     "local": "tsx scripts/dev-server.mjs",
-    "start": "tsx --env-file=.env src/server.ts",
-    "migrate": "tsx --env-file=.env src/migrate.ts",
-    "seed": "tsx --env-file=.env scripts/seed.ts",
+    "start": "node dist/src/server.js",
+    "start:ts": "tsx src/server.ts",
+    "migrate": "node dist/src/migrate.js",
+    "migrate:ts": "tsx src/migrate.ts",
+    "seed": "tsx scripts/seed.ts",
     "test": "tsx --test test/mvp.test.ts",
     "test:postgres": "tsx scripts/test-postgres.mjs",
     "typecheck": "tsc --noEmit"
@@ -20,14 +23,14 @@
     "@js-temporal/polyfill": "^0.5.1",
     "fastify": "^5.4.0",
     "nodemailer": "^10.0.12",
-    "pg": "^8.16.3"
+    "pg": "^8.16.3",
+    "tsx": "^4.20.3"
   },
   "devDependencies": {
     "@types/node": "^22.15.30",
     "@types/nodemailer": "^8.0.2",
     "@types/pg": "^8.15.4",
     "embedded-postgres": "16.14.0-beta.17",
-    "tsx": "^4.20.3",
     "typescript": "^5.8.3"
   }
 }
