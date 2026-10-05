@@ -23,6 +23,7 @@ const poolConfig: PoolConfig = {
 // Enable SSL for cloud PostgreSQL when requested or when deploying to production with a remote DB
 if (
   connectionString &&
+  process.env.DATABASE_SSL !== 'false' &&
   (process.env.DATABASE_SSL === 'true' ||
     (isProduction && !connectionString.includes('127.0.0.1') && !connectionString.includes('localhost')))
 ) {
